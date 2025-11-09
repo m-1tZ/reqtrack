@@ -10,12 +10,12 @@ type PostDataEntryExtended struct {
 	DecodedText string `json:"decoded_text"`
 }
 
-type ResponseInfo struct {
-	Status     int               `json:"status"`
-	StatusText string            `json:"status_text"`
-	Headers    map[string]string `json:"headers"`
-	MIMEType   string            `json:"mime_type"`
-}
+// type ResponseInfo struct {
+// 	Status     int               `json:"status"`
+// 	StatusText string            `json:"status_text"`
+// 	Headers    map[string]string `json:"headers"`
+// 	MIMEType   string            `json:"mime_type"`
+// }
 
 type RequestEntry struct {
 	URL             string                   `json:"url"`
@@ -24,13 +24,5 @@ type RequestEntry struct {
 	ContentType     string                   `json:"content_type"`
 	QueryParams     []Param                  `json:"query_params"`
 	PostDataEntries []*PostDataEntryExtended `json:"post_data_entries"`
-	Response        *ResponseInfo            `json:"response,omitempty"`
-}
-
-type StaticHttpPrimitive struct {
-	Primitive   string `json:"primitive"`
-	URL         string `json:"url"`
-	Method      string `json:"method"`
-	ContentType string `json:"content_type"`
-	Body        string `json:"body"`
+	// Response        *ResponseInfo            `json:"response,omitempty"`
 }

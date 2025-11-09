@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/chromedp/chromedp"
-	"github.com/m-1tZ/reqtrack/pkg/scrape"
+	"github.com/m-1tZ/reqtrack/pkg/capture"
 )
 
 func main() {
@@ -53,25 +53,23 @@ func main() {
 
 	// type RequestEntry - WORKS
 
-	// results, err := capture.CaptureRequests(ctx, targetURL, header, time.Duration(timeout)*time.Second)
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
-	// // fmt.Println(results)
-
-	// out, _ := json.MarshalIndent(results, "", "  ")
-	// fmt.Println(string(out))
-
-	// Static
-	staticFindings, err := scrape.ScrapeHtml(ctx, targetURL, header, time.Duration(timeout)*time.Second)
+	results, err := capture.CaptureRequests(ctx, targetURL, header, time.Duration(timeout)*time.Second)
 	if err != nil {
 		log.Fatal(err)
 	}
+	// fmt.Println(results)
 
-	// //fmt.Println(staticFindings)
-
-	out, _ := json.MarshalIndent(staticFindings, "", "  ")
+	out, _ := json.MarshalIndent(results, "", "  ")
 	fmt.Println(string(out))
+
+	// // Static
+	// staticFindings, err := scrape.ScrapeHtml(ctx, targetURL, header, time.Duration(timeout)*time.Second)
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
+
+	// out, _ := json.MarshalIndent(staticFindings, "", "  ")
+	// fmt.Println(string(out))
 
 	// Write results
 	// 	out, _ := json.MarshalIndent(results, "", "  ")
@@ -79,3 +77,25 @@ func main() {
 
 	// 	fmt.Println("Captured requests written to output.har.json")
 }
+
+// // Navigate with timeout
+// navCtx, navCancel := context.WithTimeout(ctx, navTimeout)
+// defer navCancel()
+
+// resp, err := chromedp.RunResponse(navCtx,
+// 	chromedp.Navigate(targetURL),
+// )
+// if err != nil {
+// 	return nil, err
+// }
+
+// // After navigation, run serializeFormsAndRequests with timeout
+// scrapeCtx, scrapeCancel := context.WithTimeout(ctx, scrapingTimeout)
+// defer scrapeCancel()
+
+// var scrapeResult ScrapeResult
+// if err := chromedp.Run(scrapeCtx,
+// 	chromedp.Evaluate("serializeFormsAndRequests()", &scrapeResult),
+// ); err != nil {
+// 	return nil, err
+// }

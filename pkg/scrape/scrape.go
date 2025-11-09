@@ -10,37 +10,16 @@ import (
 	"time"
 
 	"github.com/chromedp/chromedp"
+	"github.com/m-1tZ/reqtrack/pkg/helper"
 	"github.com/m-1tZ/reqtrack/pkg/structs"
 	sitter "github.com/smacker/go-tree-sitter"
 	"github.com/smacker/go-tree-sitter/javascript"
 )
 
-// // Navigate with timeout
-// navCtx, navCancel := context.WithTimeout(ctx, navTimeout)
-// defer navCancel()
-
-// resp, err := chromedp.RunResponse(navCtx,
-// 	chromedp.Navigate(targetURL),
-// )
-// if err != nil {
-// 	return nil, err
-// }
-
-// // After navigation, run serializeFormsAndRequests with timeout
-// scrapeCtx, scrapeCancel := context.WithTimeout(ctx, scrapingTimeout)
-// defer scrapeCancel()
-
-// var scrapeResult ScrapeResult
-// if err := chromedp.Run(scrapeCtx,
-// 	chromedp.Evaluate("serializeFormsAndRequests()", &scrapeResult),
-// ); err != nil {
-// 	return nil, err
-// }
-
 // ScrapeHtml will try to collect inline & external script sources from the current page context.
 // IMPORTANT: it will first try to read document.scripts (so it will NOT navigate if the page is already loaded).
 // If that yields nothing, it falls back to navigating targetURL once.
-func ScrapeHtml(ctx context.Context, targetURL string, header string, timeout time.Duration) ([]structs.StaticHttpPrimitive, error) {
+func ScrapeHtml(ctx context.Context, targetURL string, header string, timeout time.Duration) ([]*structs.RequestEntry, error) {
 	var scripts []string
 	// try to read scripts from already-loaded page
 	err := chromedp.Run(ctx,
@@ -58,7 +37,8 @@ func ScrapeHtml(ctx context.Context, targetURL string, header string, timeout ti
 		}
 	}
 
-	var all []structs.StaticHttpPrimitive
+	var all []*structs.RequestEntry
+
 	for _, js := range scripts {
 		if js == "" {
 			continue
@@ -79,7 +59,7 @@ func ScrapeHtml(ctx context.Context, targetURL string, header string, timeout ti
 }
 
 // ---- Tree-sitter static JS detection ----
-func findHttpPrimitives(ctx context.Context, jsCode string) ([]structs.StaticHttpPrimitive, error) {
+func findHttpPrimitives(ctx context.Context, jsCode string) ([]*structs.RequestEntry, error) {
 	parser := sitter.NewParser()
 	parser.SetLanguage(javascript.GetLanguage())
 
@@ -89,7 +69,7 @@ func findHttpPrimitives(ctx context.Context, jsCode string) ([]structs.StaticHtt
 	}
 
 	root := tree.RootNode()
-	var results []structs.StaticHttpPrimitive
+	var results []*structs.RequestEntry
 
 	// --- helpers ---
 	extractString := func(node *sitter.Node) string {
@@ -217,13 +197,22 @@ func findHttpPrimitives(ctx context.Context, jsCode string) ([]structs.StaticHtt
 						}
 
 						if strings.HasPrefix(prim, "axios.") {
+							fmt.Println(args)
 							if len(args) >= 1 {
 								url = extractString(args[0])
 							}
-							if len(args) >= 2 && args[1].Type() == "object" {
+							if len(args) >= 2 {
 								method = strings.ToUpper(strings.TrimPrefix(prim, "axios."))
-								ctype = extractObjectProperty(args[1], "Content-Type")
-								body = extractObjectProperty(args[1], "data")
+
+								// second argument is usually the body
+								if args[1].Type() == "object" || args[1].Type() == "array" {
+									body = args[1].Content([]byte(jsCode))
+								}
+
+								// if there's a third argument, it might be a config object
+								if len(args) >= 3 && args[2].Type() == "object" {
+									ctype = extractObjectProperty(args[2], "Content-Type")
+								}
 							}
 						}
 
@@ -241,13 +230,29 @@ func findHttpPrimitives(ctx context.Context, jsCode string) ([]structs.StaticHtt
 					// Guess content type if missing
 					ctype = guessContentType(ctype, body)
 
-					results = append(results, structs.StaticHttpPrimitive{
-						Primitive:   prim,
+					req := &structs.RequestEntry{
 						URL:         url,
 						Method:      method,
 						ContentType: ctype,
-						Body:        body,
-					})
+						Headers:     map[string]string{},
+					}
+
+					// Fill query params if any
+					if strings.Contains(url, "?") {
+						req.QueryParams = helper.ParseQueryParams(url)
+					}
+
+					// Fill post data entries if available
+					if body != "" {
+						req.PostDataEntries = []*structs.PostDataEntryExtended{
+							{
+								Bytes:       fmt.Sprintf("%d", len(body)),
+								DecodedText: body,
+							},
+						}
+					}
+
+					results = append(results, req)
 				}
 			}
 		}
@@ -258,5 +263,32 @@ func findHttpPrimitives(ctx context.Context, jsCode string) ([]structs.StaticHtt
 	}
 
 	walk(root)
-	return results, nil
+
+	// --- Deduplicate identical requests and remove empty URL ---
+	type reqKey struct {
+		Method string
+		URL    string
+		Body   string
+	}
+	seen := make(map[reqKey]bool)
+	var deduped []*structs.RequestEntry
+	for _, r := range results {
+		if r.URL == "" {
+			continue
+		}
+
+		key := reqKey{
+			Method: r.Method,
+			URL:    r.URL,
+		}
+		if len(r.PostDataEntries) > 0 {
+			key.Body = r.PostDataEntries[0].DecodedText
+		}
+		if !seen[key] {
+			seen[key] = true
+			deduped = append(deduped, r)
+		}
+	}
+
+	return deduped, nil
 }

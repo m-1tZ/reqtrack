@@ -64,7 +64,7 @@ func CaptureRequests(ctx context.Context, targetURL string, header string, timeo
 				}
 			}
 
-			// Post data
+			// Post data - but PostDataEntries just present request body in simple text
 			if e.Request.PostDataEntries != nil {
 				for _, entry := range e.Request.PostDataEntries {
 					decoded := ""
@@ -94,23 +94,40 @@ func CaptureRequests(ctx context.Context, targetURL string, header string, timeo
 					}
 				}
 			}
+
+			fmt.Println(e.RequestID)
+			fmt.Println(req)
+			// Fetch missing POST data (for cases like fetch({body: {a:1}}))
+			if e.Request.HasPostData {
+				// go func(reqID network.RequestID, req *structs.RequestEntry) {
+				resp, err := network.GetRequestPostData(e.RequestID).Do(ctx)
+				if err == nil && resp != "" {
+					decoded := resp
+					req.PostDataEntries = append(req.PostDataEntries, &structs.PostDataEntryExtended{
+						Bytes:       base64.StdEncoding.EncodeToString([]byte(decoded)),
+						DecodedText: decoded,
+					})
+				}
+				// }(e.RequestID, req)
+			}
+
 			requests = append(requests, req)
 
-		case *network.EventResponseReceived:
-			for _, r := range requests {
-				if r.URL == e.Response.URL && r.Response == nil {
-					r.Response = &structs.ResponseInfo{
-						Status:     int(e.Response.Status),
-						StatusText: e.Response.StatusText,
-						Headers:    make(map[string]string),
-						MIMEType:   e.Response.MimeType,
-					}
-					for k, v := range e.Response.Headers {
-						r.Response.Headers[k] = fmt.Sprintf("%v", v)
-					}
-					break
-				}
-			}
+			// case *network.EventResponseReceived:
+			// 	for _, r := range requests {
+			// 		if r.URL == e.Response.URL && r.Response == nil {
+			// 			r.Response = &structs.ResponseInfo{
+			// 				Status:     int(e.Response.Status),
+			// 				StatusText: e.Response.StatusText,
+			// 				Headers:    make(map[string]string),
+			// 				MIMEType:   e.Response.MimeType,
+			// 			}
+			// 			for k, v := range e.Response.Headers {
+			// 				r.Response.Headers[k] = fmt.Sprintf("%v", v)
+			// 			}
+			// 			break
+			// 		}
+			// 	}
 		}
 	})
 
