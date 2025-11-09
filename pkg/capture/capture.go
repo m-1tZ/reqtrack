@@ -21,8 +21,10 @@ func CaptureRequests(ctx context.Context, targetURL string, header string, timeo
 	headers := helper.ParseHeaderFlag(header)
 
 	// Enable network
-	// TODO implement RunResponse with navigation timeout
-	if err := chromedp.Run(ctx, network.Enable(), network.SetExtraHTTPHeaders(network.Headers(headers))); err != nil {
+	if err := chromedp.Run(ctx,
+		network.Enable(),
+		network.SetExtraHTTPHeaders(network.Headers(headers)),
+	); err != nil {
 		return nil, err
 	}
 
@@ -30,6 +32,11 @@ func CaptureRequests(ctx context.Context, targetURL string, header string, timeo
 	chromedp.ListenTarget(ctx, func(ev interface{}) {
 		switch e := ev.(type) {
 		case *network.EventRequestWillBeSent:
+			// Skip OPTIONS requests
+			if e.Request.Method == "OPTIONS" {
+				return
+			}
+
 			req := &structs.RequestEntry{
 				URL:     e.Request.URL,
 				Method:  e.Request.Method,
@@ -108,9 +115,22 @@ func CaptureRequests(ctx context.Context, targetURL string, header string, timeo
 	})
 
 	// JS to trigger likely network-calling functions (best-effort)
-	// TODO .test here?
 	triggerJS := `(function() {
-		const httpPattern = /\b(fetch|XMLHttpRequest|axios|\.ajax|sendBeacon|WebSocket|EventSource)\b/;
+		// === 1. Trigger all DOM-related network activity ===
+		const evs = ['click','submit','change','mouseover','input'];
+		for(const el of document.querySelectorAll('*')){
+			for(const ev of evs){
+				try { el.dispatchEvent(new Event(ev, {bubbles:true})); }catch(e){}
+			}
+		}
+
+		// Submit all forms
+		for(const form of document.forms){
+			try { form.submit(); } catch(e){}
+		}
+
+		// === 2. Execute zero-argument HTTP-related functions ===
+		const httpPattern = /\b(fetch|XMLHttpRequest|axios|\.ajax|sendBeacon|WebSocket|EventSource|Worker|SharedWorker)\b/;
 
 		// Scan all global properties for functions
 		function collectNetworkFunctions(root) {
@@ -157,20 +177,15 @@ func CaptureRequests(ctx context.Context, targetURL string, header string, timeo
 				console.warn("Error executing", name, e);
 			}
 		}
-
-		// Also trigger forms (optional)
-		for (const form of document.forms) {
-			try { form.submit(); } catch(e) {}
-		}
 	})();
 	`
 
-	// navigate + evaluate + wait
-	// TODO RunResponse with navigation timeout
+	// navigate + evaluate
+	// TODO implement RunResponse with navigation timeout
 	if err := chromedp.Run(ctx,
 		chromedp.Navigate(targetURL),
+		chromedp.WaitReady("body", chromedp.ByQuery),
 		chromedp.Evaluate(triggerJS, nil),
-		//chromedp.Sleep(wait), # TODO we do we need this?
 	); err != nil {
 		return nil, err
 	}

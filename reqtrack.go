@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/chromedp/chromedp"
-	"github.com/m-1tZ/reqtrack/pkg/capture"
 	"github.com/m-1tZ/reqtrack/pkg/scrape"
 )
 
@@ -51,14 +50,17 @@ func main() {
 	defer cancelCtx()
 
 	// Capture/dynamic
-	results, err := capture.CaptureRequests(ctx, targetURL, header, time.Duration(timeout)*time.Second)
-	if err != nil {
-		log.Fatal(err)
-	}
-	// fmt.Println(results)
 
-	out, _ := json.MarshalIndent(results, "", "  ")
-	fmt.Println(string(out))
+	// type RequestEntry - WORKS
+
+	// results, err := capture.CaptureRequests(ctx, targetURL, header, time.Duration(timeout)*time.Second)
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
+	// // fmt.Println(results)
+
+	// out, _ := json.MarshalIndent(results, "", "  ")
+	// fmt.Println(string(out))
 
 	// Static
 	staticFindings, err := scrape.ScrapeHtml(ctx, targetURL, header, time.Duration(timeout)*time.Second)
@@ -66,9 +68,9 @@ func main() {
 		log.Fatal(err)
 	}
 
-	//fmt.Println(staticFindings)
+	// //fmt.Println(staticFindings)
 
-	out, _ = json.MarshalIndent(staticFindings, "", "  ")
+	out, _ := json.MarshalIndent(staticFindings, "", "  ")
 	fmt.Println(string(out))
 
 	// Write results

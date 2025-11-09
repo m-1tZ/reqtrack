@@ -40,7 +40,7 @@ import (
 // ScrapeHtml will try to collect inline & external script sources from the current page context.
 // IMPORTANT: it will first try to read document.scripts (so it will NOT navigate if the page is already loaded).
 // If that yields nothing, it falls back to navigating targetURL once.
-func ScrapeHtml(ctx context.Context, targetURL string, header string, wait time.Duration) ([]structs.StaticHttpPrimitive, error) {
+func ScrapeHtml(ctx context.Context, targetURL string, header string, timeout time.Duration) ([]structs.StaticHttpPrimitive, error) {
 	var scripts []string
 	// try to read scripts from already-loaded page
 	err := chromedp.Run(ctx,
@@ -50,8 +50,9 @@ func ScrapeHtml(ctx context.Context, targetURL string, header string, wait time.
 		// fallback: navigate once and get scripts
 		if err := chromedp.Run(ctx,
 			chromedp.Navigate(targetURL),
-			chromedp.Sleep(wait),
+			chromedp.WaitReady("body", chromedp.ByQuery),
 			chromedp.Evaluate(`Array.from(document.scripts).map(s => s.src ? s.src : s.innerText);`, &scripts),
+			// chromedp.Sleep(5),
 		); err != nil {
 			return nil, err
 		}
