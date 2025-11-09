@@ -14,12 +14,14 @@ import (
 	"github.com/m-1tZ/reqtrack/pkg/structs"
 )
 
-func CaptureRequests(ctx context.Context, url string, header string, wait time.Duration) ([]*structs.RequestEntry, error) {
+// CaptureRequests navigates to targetURL, triggers some JS heuristics and captures runtime network events.
+func CaptureRequests(ctx context.Context, targetURL string, header string, timeout time.Duration) ([]*structs.RequestEntry, error) {
 	var requests []*structs.RequestEntry
 
 	headers := helper.ParseHeaderFlag(header)
 
 	// Enable network
+	// TODO implement RunResponse with navigation timeout
 	if err := chromedp.Run(ctx, network.Enable(), network.SetExtraHTTPHeaders(network.Headers(headers))); err != nil {
 		return nil, err
 	}
@@ -70,6 +72,7 @@ func CaptureRequests(ctx context.Context, url string, header string, wait time.D
 					})
 
 					// Parse form-urlencoded into QueryParams
+					// TODO parse other CT as well
 					if strings.Contains(strings.ToLower(req.ContentType), "application/x-www-form-urlencoded") {
 						if vals, err := urlpkg.ParseQuery(decoded); err == nil {
 							for name, values := range vals {
@@ -104,99 +107,71 @@ func CaptureRequests(ctx context.Context, url string, header string, wait time.D
 		}
 	})
 
-	// JS to trigger all functions containing HTTP primitives
-
-	// Approach runtime reflection
+	// JS to trigger likely network-calling functions (best-effort)
+	// TODO .test here?
 	triggerJS := `(function() {
-    const httpPattern = /\b(fetch|XMLHttpRequest|axios|\.ajax|sendBeacon|WebSocket|EventSource)\b/;
+		const httpPattern = /\b(fetch|XMLHttpRequest|axios|\.ajax|sendBeacon|WebSocket|EventSource)\b/;
 
-    // Scan all global properties for functions
-    function collectNetworkFunctions(root) {
-        const results = [];
-        const seen = new WeakSet();
+		// Scan all global properties for functions
+		function collectNetworkFunctions(root) {
+			const results = [];
+			const seen = new WeakSet();
 
-        for (const key of Object.getOwnPropertyNames(root)) {
-            try {
-                const val = root[key];
-                if (typeof val === "function" && !seen.has(val)) {
-                    seen.add(val);
+			for (const key of Object.getOwnPropertyNames(root)) {
+				try {
+					const val = root[key];
+					if (typeof val === "function" && !seen.has(val)) {
+						seen.add(val);
 
-                    // Cheap pre-check: function name
-                    if (!httpPattern.test(val.name)) {
-                        // Expensive: fallback to toString only if necessary
-                        const src = Function.prototype.toString.call(val);
-                        if (httpPattern.test(src) && !src.includes("[native code]")) {
-                            results.push({ name: key, fn: val });
-                        }
-                    } else {
-                        results.push({ name: key, fn: val });
-                    }
-                }
-            } catch (e) {
-                // Skip non-readable properties
-            }
-        }
-        return results;
-    }
+						// Cheap pre-check: function name
+						if (!httpPattern.test(val.name)) {
+							// Expensive: fallback to toString only if necessary
+							const src = Function.prototype.toString.call(val);
+							if (httpPattern.test(src) && !src.includes("[native code]")) {
+								results.push({ name: key, fn: val });
+							}
+						} else {
+							results.push({ name: key, fn: val });
+						}
+					}
+				} catch (e) {
+					// Skip non-readable properties
+				}
+			}
+			return results;
+		}
 
-    // Collect once
-    const candidates = collectNetworkFunctions(window);
+		// Collect once
+		const candidates = collectNetworkFunctions(window);
 
-    console.log("Found HTTP-related functions:", candidates.map(c => c.name));
+		console.log("Found HTTP-related functions:", candidates.map(c => c.name));
 
-    // Try triggering them
-    for (const { name, fn } of candidates) {
-        try {
-            if (fn.length === 0) {
-                console.log("Triggering:", name);
-                fn();
-            }
-        } catch (e) {
-            console.warn("Error executing", name, e);
-        }
-    }
+		// Try triggering them
+		for (const { name, fn } of candidates) {
+			try {
+				if (fn.length === 0) {
+					console.log("Triggering:", name);
+					fn();
+				}
+			} catch (e) {
+				console.warn("Error executing", name, e);
+			}
+		}
 
-    // Also trigger forms (optional)
-    for (const form of document.forms) {
-        try { form.submit(); } catch(e) {}
-    }
-})();
-`
+		// Also trigger forms (optional)
+		for (const form of document.forms) {
+			try { form.submit(); } catch(e) {}
+		}
+	})();
+	`
 
-	// Old approach
-	// (function() {
-	// 		function recordNetworkFuncs(fn) {
-	// 			try {
-	// 				const src = fn.toString();
-	// 				if (/fetch\s*\(|XMLHttpRequest|axios\s*\(|\$\s*\.\s*ajax|sendBeacon|WebSocket|EventSource/.test(src)
-	// 					&& !src.includes("[native code]") && fn.length === 0) {
-	// 					fn();
-	// 				}
-	// 			} catch(e) { console.warn("Error executing function:", e); }
-	// 		}
-
-	// 		for (const key in window) {
-	// 			const val = window[key];
-	// 			if (typeof val === "function") {
-	// 				recordNetworkFuncs(val);
-	// 			}
-	// 		}
-
-	// 		// Optional: trigger forms
-	// 		Array.from(document.forms).forEach(f => {
-	// 			if (typeof f.submit === "function") {
-	// 				try { f.submit(); } catch(e) {}
-	// 			}
-	// 		});
-	// 	})();
-
-	// Navigate and inject trigger
-	err := chromedp.Run(ctx,
-		chromedp.Navigate(url),
+	// navigate + evaluate + wait
+	// TODO RunResponse with navigation timeout
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(targetURL),
 		chromedp.Evaluate(triggerJS, nil),
-		chromedp.Sleep(wait),
-	)
-	if err != nil {
+		//chromedp.Sleep(wait), # TODO we do we need this?
+	); err != nil {
 		return nil, err
 	}
 
