@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/chromedp/chromedp"
-	"github.com/m-1tZ/reqtrack/pkg/capture"
+	"github.com/m-1tZ/reqtrack/pkg/scrape"
 )
 
 func main() {
@@ -53,23 +53,23 @@ func main() {
 
 	// type RequestEntry - WORKS
 
-	results, err := capture.CaptureRequests(ctx, targetURL, header, time.Duration(timeout)*time.Second)
-	if err != nil {
-		log.Fatal(err)
-	}
-	// fmt.Println(results)
-
-	out, _ := json.MarshalIndent(results, "", "  ")
-	fmt.Println(string(out))
-
-	// // Static
-	// staticFindings, err := scrape.ScrapeHtml(ctx, targetURL, header, time.Duration(timeout)*time.Second)
+	// results, err := capture.CaptureRequests(ctx, targetURL, header, time.Duration(timeout)*time.Second)
 	// if err != nil {
 	// 	log.Fatal(err)
 	// }
+	// // fmt.Println(results)
 
-	// out, _ := json.MarshalIndent(staticFindings, "", "  ")
+	// out, _ := json.MarshalIndent(results, "", "  ")
 	// fmt.Println(string(out))
+
+	// // Static
+	staticFindings, err := scrape.ScrapeHtml(ctx, targetURL, header, time.Duration(timeout)*time.Second)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	out, _ := json.MarshalIndent(staticFindings, "", "  ")
+	fmt.Println(string(out))
 
 	// Write results
 	// 	out, _ := json.MarshalIndent(results, "", "  ")

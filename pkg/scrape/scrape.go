@@ -2,10 +2,11 @@ package scrape
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
+	"net/url"
 	"strings"
 	"time"
 
@@ -52,6 +53,7 @@ func ScrapeHtml(ctx context.Context, targetURL string, header string, timeout ti
 			resp.Body.Close()
 			js = string(body)
 		}
+		// Main logic
 		findings, _ := findHttpPrimitives(ctx, js)
 		all = append(all, findings...)
 	}
@@ -70,6 +72,7 @@ func findHttpPrimitives(ctx context.Context, jsCode string) ([]*structs.RequestE
 
 	root := tree.RootNode()
 	var results []*structs.RequestEntry
+	src := []byte(jsCode)
 
 	// --- helpers ---
 	extractString := func(node *sitter.Node) string {
@@ -110,24 +113,40 @@ func findHttpPrimitives(ctx context.Context, jsCode string) ([]*structs.RequestE
 		return ""
 	}
 
-	guessContentType := func(explicitType, body string) string {
+	// Guess content type from body or explicit header.
+	guessContentType := func(explicitType, body, method string) string {
 		if explicitType != "" {
 			return explicitType
 		}
+		body = strings.TrimSpace(body)
 		if body == "" {
-			return ""
-		}
-		trimmed := strings.TrimSpace(body)
-		if strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}") {
-			return "application/json"
-		}
-		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
-			return "application/json"
-		}
-		if regexp.MustCompile(`^[^=&]+=[^=&]+(&[^=&]+=[^=&]+)*$`).MatchString(trimmed) {
+			// No body -> only assign default if non-GET
+			if strings.EqualFold(method, "GET") || strings.EqualFold(method, "HEAD") {
+				return ""
+			}
 			return "application/x-www-form-urlencoded"
 		}
-		return "text/plain"
+
+		// Detect XML
+		if strings.HasPrefix(body, "<?xml version=") {
+			return "application/xml"
+		}
+
+		// Detect JSON
+		if (strings.HasPrefix(body, "{") && strings.HasSuffix(body, "}")) ||
+			(strings.HasPrefix(body, "[") && strings.HasSuffix(body, "]")) {
+			if json.Valid([]byte(body)) {
+				return "application/json"
+			}
+		}
+
+		// Detect form-encoded
+		if _, err := url.ParseQuery(body); err == nil && strings.Contains(body, "=") {
+			return "application/x-www-form-urlencoded"
+		}
+
+		// Fallback default
+		return "application/x-www-form-urlencoded"
 	}
 
 	// --- AST walker ---
@@ -140,10 +159,11 @@ func findHttpPrimitives(ctx context.Context, jsCode string) ([]*structs.RequestE
 		if node.Type() == "call_expression" {
 			funcNode := node.ChildByFieldName("function")
 			if funcNode != nil {
-				funcName := funcNode.Content([]byte(jsCode))
+				funcName := funcNode.Content(src)
 				prim := ""
 				isFetch := false
 				isXHROpen := false
+				isXHRSend := false
 
 				switch funcNode.Type() {
 				case "identifier":
@@ -151,19 +171,29 @@ func findHttpPrimitives(ctx context.Context, jsCode string) ([]*structs.RequestE
 						prim = "fetch"
 						isFetch = true
 					}
+					if funcName == "axios" {
+						prim = "axios"
+					}
 				case "member_expression":
 					obj := funcNode.ChildByFieldName("object")
 					prop := funcNode.ChildByFieldName("property")
 					if obj != nil && prop != nil {
-						if obj.Content([]byte(jsCode)) == "axios" {
-							prim = "axios." + prop.Content([]byte(jsCode))
+						// axios.<method>()
+						if obj.Content(src) == "axios" {
+							prim = "axios." + prop.Content(src)
 						}
-						if obj.Content([]byte(jsCode)) == "$" && prop.Content([]byte(jsCode)) == "ajax" {
+						// $.ajax(...)
+						if obj.Content(src) == "$" && prop.Content(src) == "ajax" {
 							prim = "$.ajax"
 						}
-						if prop.Content([]byte(jsCode)) == "open" {
+						// XMLHttpRequest.open/send(...)
+						if prop.Content(src) == "open" {
 							prim = "XMLHttpRequest.open"
 							isXHROpen = true
+						}
+						if prop.Content(src) == "send" {
+							prim = "XMLHttpRequest.send"
+							isXHRSend = true
 						}
 					}
 				}
@@ -178,6 +208,7 @@ func findHttpPrimitives(ctx context.Context, jsCode string) ([]*structs.RequestE
 							args = append(args, argsNode.NamedChild(i))
 						}
 
+						// --- fetch() ---
 						if isFetch {
 							if len(args) >= 1 {
 								url = extractString(args[0])
@@ -189,6 +220,7 @@ func findHttpPrimitives(ctx context.Context, jsCode string) ([]*structs.RequestE
 							}
 						}
 
+						// --- XMLHttpRequest.open(method, url) ---
 						if isXHROpen {
 							if len(args) >= 2 {
 								method = extractString(args[0])
@@ -196,26 +228,49 @@ func findHttpPrimitives(ctx context.Context, jsCode string) ([]*structs.RequestE
 							}
 						}
 
+						// --- XMLHttpRequest.send(body) ---
+						if isXHRSend && len(args) >= 1 {
+							body = extractString(args[0])
+						}
+
+						// --- axios.post(...) / axios.get(...) etc. ---
 						if strings.HasPrefix(prim, "axios.") {
-							fmt.Println(args)
 							if len(args) >= 1 {
 								url = extractString(args[0])
 							}
 							if len(args) >= 2 {
 								method = strings.ToUpper(strings.TrimPrefix(prim, "axios."))
 
-								// second argument is usually the body
+								// Second argument is usually the body
 								if args[1].Type() == "object" || args[1].Type() == "array" {
-									body = args[1].Content([]byte(jsCode))
+									body = args[1].Content(src)
 								}
 
-								// if there's a third argument, it might be a config object
+								// Third argument may be config
 								if len(args) >= 3 && args[2].Type() == "object" {
 									ctype = extractObjectProperty(args[2], "Content-Type")
 								}
 							}
 						}
 
+						// --- axios({ url, method, data, headers }) ---
+						if prim == "axios" {
+							if len(args) >= 1 && args[0].Type() == "object" {
+								url = extractObjectProperty(args[0], "url")
+								method = extractObjectProperty(args[0], "method")
+								ctype = extractObjectProperty(args[0], "Content-Type")
+								body = extractObjectProperty(args[0], "data")
+							}
+							if len(args) >= 2 && args[1].Type() == "object" {
+								// axios(url, config)
+								url = extractString(args[0])
+								method = extractObjectProperty(args[1], "method")
+								ctype = extractObjectProperty(args[1], "Content-Type")
+								body = extractObjectProperty(args[1], "data")
+							}
+						}
+
+						// --- $.ajax({...}) ---
 						if prim == "$.ajax" && len(args) >= 1 && args[0].Type() == "object" {
 							url = extractObjectProperty(args[0], "url")
 							method = extractObjectProperty(args[0], "method")
@@ -227,8 +282,14 @@ func findHttpPrimitives(ctx context.Context, jsCode string) ([]*structs.RequestE
 						}
 					}
 
+					// Normalize method
+					method = strings.ToUpper(strings.TrimSpace(method))
+					if method == "" {
+						method = "GET"
+					}
+
 					// Guess content type if missing
-					ctype = guessContentType(ctype, body)
+					ctype = guessContentType(ctype, body, method)
 
 					req := &structs.RequestEntry{
 						URL:         url,
