@@ -6,10 +6,14 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/url"
 	"time"
 
 	"github.com/chromedp/chromedp"
+	"github.com/m-1tZ/reqtrack/pkg/capture"
+	"github.com/m-1tZ/reqtrack/pkg/helper"
 	"github.com/m-1tZ/reqtrack/pkg/scrape"
+	"github.com/m-1tZ/reqtrack/pkg/structs"
 )
 
 func main() {
@@ -49,26 +53,70 @@ func main() {
 	ctx, cancelCtx := chromedp.NewContext(allocCtx)
 	defer cancelCtx()
 
+	// Fill context
+	ctx = context.WithValue(ctx, "targetURL", targetURL)
+	ctx = context.WithValue(ctx, "header", header)
+	ctx = context.WithValue(ctx, "timeout", time.Duration(timeout)*time.Second)
+
 	// Capture/dynamic
 
 	// type RequestEntry - WORKS
 
-	// results, err := capture.CaptureRequests(ctx, targetURL, header, time.Duration(timeout)*time.Second)
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
-	// // fmt.Println(results)
-
-	// out, _ := json.MarshalIndent(results, "", "  ")
-	// fmt.Println(string(out))
-
-	// // Static
-	staticFindings, err := scrape.ScrapeHtml(ctx, targetURL, header, time.Duration(timeout)*time.Second)
+	results, err := capture.CaptureRequests(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	out, _ := json.MarshalIndent(staticFindings, "", "  ")
+	// out, _ := json.MarshalIndent(results, "", "  ")
+	// fmt.Println(string(out))
+
+	// Static
+	staticFindings, err := scrape.ScrapeHtml(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// out, _ = json.MarshalIndent(staticFindings, "", "  ")
+	// fmt.Println(string(out))
+
+	parsedBase, _ := url.Parse(targetURL)
+	baseOrigin := parsedBase.Scheme + "://" + parsedBase.Host
+
+	// Merge dynamic and static findings
+	combined := append(results, staticFindings...)
+
+	// Deduplicate exact requests (reuse your logic)
+	type reqKey struct {
+		Method string
+		URL    string
+		Body   string
+	}
+
+	seen := make(map[reqKey]bool)
+	var deduped []*structs.RequestEntry
+
+	for _, r := range combined {
+		if r.URL == "" {
+			continue
+		}
+
+		key := reqKey{
+			Method: r.Method,
+			URL:    helper.SanitizeURL(r.URL, baseOrigin),
+		}
+
+		if len(r.PostDataEntries) > 0 {
+			key.Body = r.PostDataEntries[0].DecodedText
+		}
+
+		if !seen[key] {
+			seen[key] = true
+			r.URL = helper.SanitizeURL(r.URL, baseOrigin)
+			deduped = append(deduped, r)
+		}
+	}
+
+	out, _ := json.MarshalIndent(deduped, "", "  ")
 	fmt.Println(string(out))
 
 	// Write results

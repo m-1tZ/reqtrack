@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"net/url"
 	urlpkg "net/url"
 	"strings"
 	"time"
@@ -14,14 +15,45 @@ import (
 	"github.com/m-1tZ/reqtrack/pkg/structs"
 )
 
+// // Navigate with timeout
+// navCtx, navCancel := context.WithTimeout(ctx, navTimeout)
+// defer navCancel()
+
+// resp, err := chromedp.RunResponse(navCtx,
+// 	chromedp.Navigate(targetURL),
+// )
+// if err != nil {
+// 	return nil, err
+// }
+
+// // After navigation, run serializeFormsAndRequests with timeout
+// scrapeCtx, scrapeCancel := context.WithTimeout(ctx, scrapingTimeout)
+// defer scrapeCancel()
+
+// var scrapeResult ScrapeResult
+// if err := chromedp.Run(scrapeCtx,
+// 	chromedp.Evaluate("serializeFormsAndRequests()", &scrapeResult),
+// ); err != nil {
+// 	return nil, err
+// }
+
 // CaptureRequests navigates to targetURL, triggers some JS heuristics and captures runtime network events.
-func CaptureRequests(ctx context.Context, targetURL string, header string, timeout time.Duration) ([]*structs.RequestEntry, error) {
+func CaptureRequests(ctx context.Context) ([]*structs.RequestEntry, error) {
 	var requests []*structs.RequestEntry
 
+	targetURL := ctx.Value("targetURL").(string)
+	header := ctx.Value("header").(string)
+	parsedBase, _ := url.Parse(targetURL)
+	baseOrigin := parsedBase.Scheme + "://" + parsedBase.Host
+	timeout := ctx.Value("timeout").(time.Duration)
 	headers := helper.ParseHeaderFlag(header)
 
+	// Navigate with timeout
+	navCtx, navCancel := context.WithTimeout(ctx, timeout)
+	defer navCancel()
+
 	// Enable network
-	if err := chromedp.Run(ctx,
+	if err := chromedp.Run(navCtx,
 		network.Enable(),
 		network.SetExtraHTTPHeaders(network.Headers(headers)),
 	); err != nil {
@@ -29,7 +61,7 @@ func CaptureRequests(ctx context.Context, targetURL string, header string, timeo
 	}
 
 	// Listen for network events
-	chromedp.ListenTarget(ctx, func(ev interface{}) {
+	chromedp.ListenTarget(navCtx, func(ev interface{}) {
 		switch e := ev.(type) {
 		case *network.EventRequestWillBeSent:
 			// Skip OPTIONS requests
@@ -73,7 +105,7 @@ func CaptureRequests(ctx context.Context, targetURL string, header string, timeo
 							decoded = string(b)
 						}
 					}
-					req.PostDataEntries = append(req.PostDataEntries, &structs.PostDataEntryExtended{
+					req.PostDataEntries = append(req.PostDataEntries, &structs.BodyDataEntryExtended{
 						Bytes:       entry.Bytes,
 						DecodedText: decoded,
 					})
@@ -95,15 +127,13 @@ func CaptureRequests(ctx context.Context, targetURL string, header string, timeo
 				}
 			}
 
-			fmt.Println(e.RequestID)
-			fmt.Println(req)
 			// Fetch missing POST data (for cases like fetch({body: {a:1}}))
 			if e.Request.HasPostData {
 				// go func(reqID network.RequestID, req *structs.RequestEntry) {
 				resp, err := network.GetRequestPostData(e.RequestID).Do(ctx)
 				if err == nil && resp != "" {
 					decoded := resp
-					req.PostDataEntries = append(req.PostDataEntries, &structs.PostDataEntryExtended{
+					req.PostDataEntries = append(req.PostDataEntries, &structs.BodyDataEntryExtended{
 						Bytes:       base64.StdEncoding.EncodeToString([]byte(decoded)),
 						DecodedText: decoded,
 					})
@@ -199,9 +229,10 @@ func CaptureRequests(ctx context.Context, targetURL string, header string, timeo
 
 	// navigate + evaluate
 	// TODO implement RunResponse with navigation timeout
-	if err := chromedp.Run(ctx,
+	if err := chromedp.Run(navCtx,
 		chromedp.Navigate(targetURL),
-		chromedp.WaitReady("body", chromedp.ByQuery),
+		// chromedp.WaitVisible("body", chromedp.ByQuery),
+		// chromedp.WaitReady("body", chromedp.ByQuery),
 		chromedp.Evaluate(triggerJS, nil),
 	); err != nil {
 		return nil, err
@@ -215,16 +246,22 @@ func CaptureRequests(ctx context.Context, targetURL string, header string, timeo
 	}
 	seen := make(map[reqKey]bool)
 	var deduped []*structs.RequestEntry
+
 	for _, r := range requests {
+		if r.URL == "" {
+			continue
+		}
+
 		key := reqKey{
 			Method: r.Method,
-			URL:    r.URL,
+			URL:    helper.SanitizeURL(r.URL, baseOrigin),
 		}
 		if len(r.PostDataEntries) > 0 {
 			key.Body = r.PostDataEntries[0].DecodedText
 		}
 		if !seen[key] {
 			seen[key] = true
+			r.URL = helper.SanitizeURL(r.URL, baseOrigin)
 			deduped = append(deduped, r)
 		}
 	}

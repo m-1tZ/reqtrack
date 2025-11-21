@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
 	"github.com/m-1tZ/reqtrack/pkg/helper"
 	"github.com/m-1tZ/reqtrack/pkg/structs"
@@ -20,19 +21,30 @@ import (
 // ScrapeHtml will try to collect inline & external script sources from the current page context.
 // IMPORTANT: it will first try to read document.scripts (so it will NOT navigate if the page is already loaded).
 // If that yields nothing, it falls back to navigating targetURL once.
-func ScrapeHtml(ctx context.Context, targetURL string, header string, timeout time.Duration) ([]*structs.RequestEntry, error) {
+func ScrapeHtml(ctx context.Context) ([]*structs.RequestEntry, error) {
 	var scripts []string
+
+	targetURL := ctx.Value("targetURL").(string)
+	header := ctx.Value("header").(string)
+	timeout := ctx.Value("timeout").(time.Duration)
+	headers := helper.ParseHeaderFlag(header)
+
+	// Navigate with timeout
+	navCtx, navCancel := context.WithTimeout(ctx, timeout)
+	defer navCancel()
+
 	// try to read scripts from already-loaded page
-	err := chromedp.Run(ctx,
+	err := chromedp.Run(navCtx,
 		chromedp.Evaluate(`Array.from(document.scripts).map(s => s.src ? s.src : s.innerText);`, &scripts),
 	)
 	if err != nil || len(scripts) == 0 {
 		// fallback: navigate once and get scripts
-		if err := chromedp.Run(ctx,
+		if err := chromedp.Run(navCtx,
 			chromedp.Navigate(targetURL),
-			chromedp.WaitReady("body", chromedp.ByQuery),
+			network.SetExtraHTTPHeaders(network.Headers(headers)),
+			// chromedp.WaitVisible("body", chromedp.ByQuery),
+			// chromedp.WaitReady("body", chromedp.ByQuery),
 			chromedp.Evaluate(`Array.from(document.scripts).map(s => s.src ? s.src : s.innerText);`, &scripts),
-			// chromedp.Sleep(5),
 		); err != nil {
 			return nil, err
 		}
@@ -305,7 +317,7 @@ func findHttpPrimitives(ctx context.Context, jsCode string) ([]*structs.RequestE
 
 					// Fill post data entries if available
 					if body != "" {
-						req.PostDataEntries = []*structs.PostDataEntryExtended{
+						req.PostDataEntries = []*structs.BodyDataEntryExtended{
 							{
 								Bytes:       fmt.Sprintf("%d", len(body)),
 								DecodedText: body,
@@ -331,22 +343,37 @@ func findHttpPrimitives(ctx context.Context, jsCode string) ([]*structs.RequestE
 		URL    string
 		Body   string
 	}
+
 	seen := make(map[reqKey]bool)
 	var deduped []*structs.RequestEntry
+
+	targetURL := ctx.Value("targetURL").(string)
+	parsedBase, _ := url.Parse(targetURL)
+	baseOrigin := parsedBase.Scheme + "://" + parsedBase.Host
+
 	for _, r := range results {
 		if r.URL == "" {
 			continue
 		}
 
+		// Sanitize and normalize URLs (if variable ${} and then /<path>, just remove and pretend to target the root of the current origin) such as
+		// "url": "${f.getAuthServiceUrl()}/userinfo?origin=client",
+		// "url": "${(0,Vl.pN)(\"/_/api/commerce/prod\")}/shop/init-transaction/datatrans",
+		// "url": "/assets/files/lawyers/Anwaltsnetz_Tabelle.json",
+		// "url": "http://localhost:3000/external-executed",
+
+		// We always want absolute URLs, not relativ - thus get the targetURL and take the scheme + host and append relative
 		key := reqKey{
 			Method: r.Method,
-			URL:    r.URL,
+			URL:    helper.SanitizeURL(r.URL, baseOrigin), // r.URL
 		}
 		if len(r.PostDataEntries) > 0 {
 			key.Body = r.PostDataEntries[0].DecodedText
 		}
 		if !seen[key] {
 			seen[key] = true
+			// Not just above in the dedupe key, also overwrite URL with sanitized URL
+			r.URL = helper.SanitizeURL(r.URL, baseOrigin)
 			deduped = append(deduped, r)
 		}
 	}

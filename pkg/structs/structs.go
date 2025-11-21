@@ -5,7 +5,7 @@ type Param struct {
 	Value string `json:"value"`
 }
 
-type PostDataEntryExtended struct {
+type BodyDataEntryExtended struct {
 	Bytes       string `json:"bytes"`
 	DecodedText string `json:"decoded_text"`
 }
@@ -23,6 +23,6 @@ type RequestEntry struct {
 	Headers         map[string]string        `json:"headers"`
 	ContentType     string                   `json:"content_type"`
 	QueryParams     []Param                  `json:"query_params"`
-	PostDataEntries []*PostDataEntryExtended `json:"post_data_entries"`
+	PostDataEntries []*BodyDataEntryExtended `json:"body_data_entries"`
 	// Response        *ResponseInfo            `json:"response,omitempty"`
 }
