@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -20,15 +21,16 @@ import (
 // ScrapeHtml will try to collect inline & external script sources from the current page context.
 // IMPORTANT: it will first try to read document.scripts (so it will NOT navigate if the page is already loaded).
 // If that yields nothing, it falls back to navigating targetURL once.
-func ScrapeHtml(ctx context.Context) ([]*structs.RequestEntry, error) {
+func ScrapeRequests(ctx pw.BrowserContext, page pw.Page, targetURL string) error
 	var scripts []string
 
-	targetURL := ctx.Value("targetURL").(string)
-	scrapeTimeout := ctx.Value("scrapeTimeout").(time.Duration)
-
-	// Navigate with timeout
-	navCtx, navCancel := context.WithTimeout(ctx, scrapeTimeout)
-	defer navCancel()
+	// Navigate and wait for network to be idle
+	_, err := page.Goto(targetURL, pw.PageGotoOptions{
+		WaitUntil: pw.WaitUntilStateNetworkidle,
+	})
+	if err != nil {
+		return fmt.Errorf("goto failed: %w", err)
+	}
 
 	// try to read scripts from already-loaded page
 	err := chromedp.Run(navCtx,
@@ -374,4 +376,77 @@ func findHttpPrimitives(ctx context.Context, jsCode string) ([]*structs.RequestE
 	}
 
 	return deduped, nil
+}
+
+// // ---- Patch HAR with static entries ----
+// if err := addStaticEntriesToHar(harPath); err != nil {
+// 	log.Fatal(err)
+// }
+
+func addStaticEntriesToHar(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	var har map[string]interface{}
+	if err := json.Unmarshal(data, &har); err != nil {
+		return err
+	}
+
+	// Detailed HAR spec root keys:
+	// har["log"].(map[string]interface{})["entries"].([]interface{})
+
+	logObj, ok := har["log"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	entries, ok := logObj["entries"].([]interface{})
+	if !ok {
+		return nil
+	}
+
+	// ---- YOUR STATIC HAR ENTRY PLACEHOLDER ----
+	staticEntry := map[string]interface{}{
+		"startedDateTime": "2025-01-01T00:00:00.000Z",
+		"time":            0,
+		"request": map[string]interface{}{
+			"method":      "GET",
+			"url":         "https://example.com/static-found",
+			"httpVersion": "HTTP/1.1",
+			"headers":     []interface{}{},
+			"queryString": []interface{}{},
+			"cookies":     []interface{}{},
+			"headersSize": -1,
+			"bodySize":    0,
+		},
+		"response": map[string]interface{}{
+			"status":      0,
+			"statusText":  "",
+			"httpVersion": "HTTP/1.1",
+			"headers":     []interface{}{},
+			"cookies":     []interface{}{},
+			"content": map[string]interface{}{
+				"size":     0,
+				"mimeType": "text/plain",
+			},
+			"redirectURL": "",
+			"headersSize": -1,
+			"bodySize":    0,
+		},
+		"cache": map[string]interface{}{},
+		"timings": map[string]interface{}{
+			"send":    0,
+			"wait":    0,
+			"receive": 0,
+		},
+	}
+
+	// Append new entry to HAR
+	logObj["entries"] = append(entries, staticEntry)
+
+	// Rewrite HAR file
+	pretty, _ := json.MarshalIndent(har, "", "  ")
+	return os.WriteFile(path, pretty, 0644)
 }

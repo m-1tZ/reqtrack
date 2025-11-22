@@ -1,124 +1,78 @@
 package capture
 
 import (
-	"context"
-	"encoding/base64"
 	"fmt"
-	"net/url"
-	urlpkg "net/url"
-	"strings"
-	"time"
+	"log"
 
-	"github.com/chromedp/cdproto/network"
-	"github.com/chromedp/chromedp"
-	"github.com/m-1tZ/reqtrack/pkg/helper"
-	"github.com/m-1tZ/reqtrack/pkg/structs"
+	pw "github.com/playwright-community/playwright-go"
 )
 
-// CaptureRequests navigates to targetURL, triggers some JS heuristics and captures runtime network events.
-func CaptureRequests(ctx context.Context) ([]*structs.RequestEntry, error) {
-	var requests []*structs.RequestEntry
-
-	targetURL := ctx.Value("targetURL").(string)
-	parsedBase, _ := url.Parse(targetURL)
-	baseOrigin := parsedBase.Scheme + "://" + parsedBase.Host
-	scrapeTimeout := ctx.Value("scrapeTimeout").(time.Duration)
-	navTimeout := ctx.Value("navTimeout").(time.Duration)
-
-	// ---------------------------
-	// 1. Get created long-lived browser ctx
-	// ---------------------------
-	browserCtx := ctx
-
-	// Listen for network events
-	chromedp.ListenTarget(browserCtx, func(ev interface{}) {
-		switch e := ev.(type) {
-		//		case *network.EventResponseReceived: -> response
-		// 		case *network.EventDataReceived: -> when data chunk was received over network
-		case *network.EventRequestWillBeSent:
-			// Skip OPTIONS requests
-			if e.Request.Method == "OPTIONS" {
-				return
-			}
-
-			req := &structs.RequestEntry{
-				URL:     e.Request.URL,
-				Method:  e.Request.Method,
-				Headers: make(map[string]string),
-			}
-
-			// Headers + detect Content-Type
-			for k, v := range e.Request.Headers {
-				req.Headers[k] = fmt.Sprintf("%v", v)
-				if strings.ToLower(k) == "content-type" {
-					req.ContentType = fmt.Sprintf("%v", v)
-				}
-			}
-
-			// Query params
-			if u, err := urlpkg.Parse(e.Request.URL); err == nil { // alias net/url as urlpkg
-				q := u.Query()
-				for name, values := range q {
-					for _, v := range values {
-						req.QueryParams = append(req.QueryParams, structs.Param{
-							Name:  name,
-							Value: v,
-						})
-					}
-				}
-			}
-
-			// Post data - but PostDataEntries just present request body in simple text
-			if e.Request.PostDataEntries != nil {
-				for _, entry := range e.Request.PostDataEntries {
-					decoded := ""
-					if entry.Bytes != "" {
-						if b, err := base64.StdEncoding.DecodeString(entry.Bytes); err == nil {
-							decoded = string(b)
-						}
-					}
-					req.PostDataEntries = append(req.PostDataEntries, &structs.BodyDataEntryExtended{
-						Bytes:       entry.Bytes,
-						DecodedText: decoded,
-					})
-
-					// Parse form-urlencoded into QueryParams
-					// TODO parse other CT as well
-					if strings.Contains(strings.ToLower(req.ContentType), "application/x-www-form-urlencoded") {
-						if vals, err := urlpkg.ParseQuery(decoded); err == nil {
-							for name, values := range vals {
-								for _, v := range values {
-									req.QueryParams = append(req.QueryParams, structs.Param{
-										Name:  name,
-										Value: v,
-									})
-								}
-							}
-						}
-					}
-				}
-			}
-
-			// Fetch missing POST data (for cases like fetch({body: {a:1}}))
-			if e.Request.HasPostData {
-				// go func(reqID network.RequestID, req *structs.RequestEntry) {
-				resp, err := network.GetRequestPostData(e.RequestID).Do(ctx)
-				if err == nil && resp != "" {
-					decoded := resp
-					req.PostDataEntries = append(req.PostDataEntries, &structs.BodyDataEntryExtended{
-						Bytes:       base64.StdEncoding.EncodeToString([]byte(decoded)),
-						DecodedText: decoded,
-					})
-				}
-				// }(e.RequestID, req)
-			}
-
-			requests = append(requests, req)
-		}
+func CaptureRequests(ctx pw.BrowserContext, page pw.Page, targetURL string) error {
+	// Navigate and wait for network to be idle
+	_, err := page.Goto(targetURL, pw.PageGotoOptions{
+		WaitUntil: pw.WaitUntilStateNetworkidle,
 	})
+	if err != nil {
+		return fmt.Errorf("goto failed: %w", err)
+	}
 
-	// JS to trigger likely network-calling functions (best-effort)
-	triggerJS := `(function() {
+	// Execute your JS trigger
+	triggerJS := getTriggerJS()
+	if _, err := page.Evaluate(triggerJS); err != nil {
+		log.Println("Trigger script error:", err)
+	}
+
+	// Wait for triggered network calls to settle
+	// TODO wait for state WaitUntilStateNetworkidle
+	if err := page.WaitForLoadState(); err != nil {
+		return fmt.Errorf("wait for networkidle failed: %w", err)
+	}
+
+	return nil
+}
+
+// func CaptureRequests(ctx context.Context, browserContext pw.BrowserContext, page pw.Page, targetURL string, timeout time.Duration) error {
+// 	// Navigate and wait for network to be idle
+// 	_, err := page.Goto(targetURL, pw.PageGotoOptions{
+// 		WaitUntil: pw.WaitUntilStateNetworkidle,
+// 	})
+// 	if err != nil {
+// 		return fmt.Errorf("goto failed: %w", err)
+// 	}
+
+// 	// Execute your JS trigger with timeout
+// 	triggerJS := getTriggerJS()
+// 	done := make(chan error, 1)
+// 	go func() {
+// 		_, err := page.Evaluate(triggerJS)
+// 		done <- err
+// 	}()
+
+// 	select {
+// 	case <-ctx.Done():
+// 		return fmt.Errorf("context cancelled or timed out before JS trigger finished")
+// 	case err := <-done:
+// 		if err != nil {
+// 			return fmt.Errorf("trigger script error: %w", err)
+// 		}
+// 	}
+
+// 	// Wait for triggered network calls to settle
+// 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+// 	defer cancel()
+
+// 	if err := page.WaitForLoadState(pw.PageWaitForLoadStateOptions{
+// 		State:   pw.WaitUntilStateNetworkidle,
+// 		Timeout: timeout.Milliseconds(),
+// 	}); err != nil {
+// 		return fmt.Errorf("wait for networkidle failed: %w", err)
+// 	}
+
+// 	return nil
+// }
+
+func getTriggerJS() string {
+	return `(function() {
 		// === 1. Trigger all DOM-related network activity ===
 		const evs = ['click','submit','change','mouseover','input'];
 		for(const el of document.querySelectorAll('*')){
@@ -180,63 +134,5 @@ func CaptureRequests(ctx context.Context) ([]*structs.RequestEntry, error) {
 				console.warn("Error executing", name, e);
 			}
 		}
-	})();
-	`
-
-	// TODO do I need nav timeout
-	// ---------------------------
-	// 2. Navigation with timeout
-	// ---------------------------
-	navCtx, navCancel := context.WithTimeout(browserCtx, navTimeout)
-	defer navCancel()
-
-	if err := chromedp.Run(navCtx,
-		chromedp.Navigate(targetURL),
-	); err != nil {
-		return nil, err
-	}
-
-	// ---------------------------
-	// 3. Scrape / wait / JS trigger
-	//    using full timeout you want
-	// ---------------------------
-	scrapeCtx, scrapeCancel := context.WithTimeout(browserCtx, scrapeTimeout)
-	defer scrapeCancel()
-
-	if err := chromedp.Run(scrapeCtx,
-		chromedp.Evaluate(triggerJS, nil),
-		chromedp.WaitReady("body", chromedp.ByQuery), // allow network traffic to happen
-	); err != nil {
-		// ignore context deadline exceeded — expected when waiting ends
-	}
-
-	// Deduplicate exact requests
-	type reqKey struct {
-		Method string
-		URL    string
-		Body   string
-	}
-	seen := make(map[reqKey]bool)
-	var deduped []*structs.RequestEntry
-
-	for _, r := range requests {
-		if r.URL == "" {
-			continue
-		}
-
-		key := reqKey{
-			Method: r.Method,
-			URL:    helper.SanitizeURL(r.URL, baseOrigin),
-		}
-		if len(r.PostDataEntries) > 0 {
-			key.Body = r.PostDataEntries[0].DecodedText
-		}
-		if !seen[key] {
-			seen[key] = true
-			r.URL = helper.SanitizeURL(r.URL, baseOrigin)
-			deduped = append(deduped, r)
-		}
-	}
-
-	return deduped, nil
+	})();`
 }
