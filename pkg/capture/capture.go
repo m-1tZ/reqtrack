@@ -15,54 +15,26 @@ import (
 	"github.com/m-1tZ/reqtrack/pkg/structs"
 )
 
-// // Navigate with timeout
-// navCtx, navCancel := context.WithTimeout(ctx, navTimeout)
-// defer navCancel()
-
-// resp, err := chromedp.RunResponse(navCtx,
-// 	chromedp.Navigate(targetURL),
-// )
-// if err != nil {
-// 	return nil, err
-// }
-
-// // After navigation, run serializeFormsAndRequests with timeout
-// scrapeCtx, scrapeCancel := context.WithTimeout(ctx, scrapingTimeout)
-// defer scrapeCancel()
-
-// var scrapeResult ScrapeResult
-// if err := chromedp.Run(scrapeCtx,
-// 	chromedp.Evaluate("serializeFormsAndRequests()", &scrapeResult),
-// ); err != nil {
-// 	return nil, err
-// }
-
 // CaptureRequests navigates to targetURL, triggers some JS heuristics and captures runtime network events.
 func CaptureRequests(ctx context.Context) ([]*structs.RequestEntry, error) {
 	var requests []*structs.RequestEntry
 
 	targetURL := ctx.Value("targetURL").(string)
-	header := ctx.Value("header").(string)
 	parsedBase, _ := url.Parse(targetURL)
 	baseOrigin := parsedBase.Scheme + "://" + parsedBase.Host
-	timeout := ctx.Value("timeout").(time.Duration)
-	headers := helper.ParseHeaderFlag(header)
+	scrapeTimeout := ctx.Value("scrapeTimeout").(time.Duration)
+	navTimeout := ctx.Value("navTimeout").(time.Duration)
 
-	// Navigate with timeout
-	navCtx, navCancel := context.WithTimeout(ctx, timeout)
-	defer navCancel()
-
-	// Enable network
-	if err := chromedp.Run(navCtx,
-		network.Enable(),
-		network.SetExtraHTTPHeaders(network.Headers(headers)),
-	); err != nil {
-		return nil, err
-	}
+	// ---------------------------
+	// 1. Get created long-lived browser ctx
+	// ---------------------------
+	browserCtx := ctx
 
 	// Listen for network events
-	chromedp.ListenTarget(navCtx, func(ev interface{}) {
+	chromedp.ListenTarget(browserCtx, func(ev interface{}) {
 		switch e := ev.(type) {
+		//		case *network.EventResponseReceived: -> response
+		// 		case *network.EventDataReceived: -> when data chunk was received over network
 		case *network.EventRequestWillBeSent:
 			// Skip OPTIONS requests
 			if e.Request.Method == "OPTIONS" {
@@ -142,22 +114,6 @@ func CaptureRequests(ctx context.Context) ([]*structs.RequestEntry, error) {
 			}
 
 			requests = append(requests, req)
-
-			// case *network.EventResponseReceived:
-			// 	for _, r := range requests {
-			// 		if r.URL == e.Response.URL && r.Response == nil {
-			// 			r.Response = &structs.ResponseInfo{
-			// 				Status:     int(e.Response.Status),
-			// 				StatusText: e.Response.StatusText,
-			// 				Headers:    make(map[string]string),
-			// 				MIMEType:   e.Response.MimeType,
-			// 			}
-			// 			for k, v := range e.Response.Headers {
-			// 				r.Response.Headers[k] = fmt.Sprintf("%v", v)
-			// 			}
-			// 			break
-			// 		}
-			// 	}
 		}
 	})
 
@@ -227,15 +183,31 @@ func CaptureRequests(ctx context.Context) ([]*structs.RequestEntry, error) {
 	})();
 	`
 
-	// navigate + evaluate
-	// TODO implement RunResponse with navigation timeout
+	// TODO do I need nav timeout
+	// ---------------------------
+	// 2. Navigation with timeout
+	// ---------------------------
+	navCtx, navCancel := context.WithTimeout(browserCtx, navTimeout)
+	defer navCancel()
+
 	if err := chromedp.Run(navCtx,
 		chromedp.Navigate(targetURL),
-		// chromedp.WaitVisible("body", chromedp.ByQuery),
-		// chromedp.WaitReady("body", chromedp.ByQuery),
-		chromedp.Evaluate(triggerJS, nil),
 	); err != nil {
 		return nil, err
+	}
+
+	// ---------------------------
+	// 3. Scrape / wait / JS trigger
+	//    using full timeout you want
+	// ---------------------------
+	scrapeCtx, scrapeCancel := context.WithTimeout(browserCtx, scrapeTimeout)
+	defer scrapeCancel()
+
+	if err := chromedp.Run(scrapeCtx,
+		chromedp.Evaluate(triggerJS, nil),
+		chromedp.WaitReady("body", chromedp.ByQuery), // allow network traffic to happen
+	); err != nil {
+		// ignore context deadline exceeded — expected when waiting ends
 	}
 
 	// Deduplicate exact requests

@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
 	"github.com/m-1tZ/reqtrack/pkg/helper"
 	"github.com/m-1tZ/reqtrack/pkg/structs"
@@ -25,12 +24,10 @@ func ScrapeHtml(ctx context.Context) ([]*structs.RequestEntry, error) {
 	var scripts []string
 
 	targetURL := ctx.Value("targetURL").(string)
-	header := ctx.Value("header").(string)
-	timeout := ctx.Value("timeout").(time.Duration)
-	headers := helper.ParseHeaderFlag(header)
+	scrapeTimeout := ctx.Value("scrapeTimeout").(time.Duration)
 
 	// Navigate with timeout
-	navCtx, navCancel := context.WithTimeout(ctx, timeout)
+	navCtx, navCancel := context.WithTimeout(ctx, scrapeTimeout)
 	defer navCancel()
 
 	// try to read scripts from already-loaded page
@@ -41,10 +38,8 @@ func ScrapeHtml(ctx context.Context) ([]*structs.RequestEntry, error) {
 		// fallback: navigate once and get scripts
 		if err := chromedp.Run(navCtx,
 			chromedp.Navigate(targetURL),
-			network.SetExtraHTTPHeaders(network.Headers(headers)),
-			// chromedp.WaitVisible("body", chromedp.ByQuery),
-			// chromedp.WaitReady("body", chromedp.ByQuery),
 			chromedp.Evaluate(`Array.from(document.scripts).map(s => s.src ? s.src : s.innerText);`, &scripts),
+			chromedp.WaitReady("body", chromedp.ByQuery),
 		); err != nil {
 			return nil, err
 		}
