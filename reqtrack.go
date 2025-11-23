@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
+	"time"
 
 	"github.com/m-1tZ/reqtrack/pkg/capture"
 	"github.com/m-1tZ/reqtrack/pkg/helper"
@@ -12,16 +14,17 @@ import (
 func main() {
 	var targetURL string
 	var header string
-	var totalTimeout int64
+	var totalTimeout float64
+	var navTimeout float64
 	var proxy string
 	var harPath string
 
 	flag.StringVar(&header, "H",
 		"User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:144.0) Gecko/20100101 Firefox/144.0",
 		"Custom header")
-
 	flag.StringVar(&targetURL, "u", "", "URL to process")
-	flag.Int64Var(&totalTimeout, "t", 30, "Timeout for the total processing (default 30s)")
+	flag.Float64Var(&totalTimeout, "ttotal", 60, "Timeout for the total processing (default 60s)")
+	flag.Float64Var(&navTimeout, "tnav", 7, "Timeout for navigation and script evaluation (default 7s)")
 	flag.StringVar(&proxy, "p", "", "Optional proxy (http://127.0.0.1:8080)")
 	flag.StringVar(&harPath, "har", "traffic.har", "HAR output file")
 
@@ -31,10 +34,14 @@ func main() {
 		log.Fatal("Missing -u URL")
 	}
 
+	ctxGlobal, cancel := context.WithTimeout(context.Background(),
+		time.Duration(totalTimeout)*time.Second)
+	defer cancel()
+
 	// ---- Playwright Setup ----
-	if err := pw.Install(); err != nil {
-		log.Fatal(err)
-	}
+	// if err := pw.Install(); err != nil {
+	// 	log.Fatal(err)
+	// }
 
 	pwRunner, err := pw.Run()
 	if err != nil {
@@ -57,7 +64,7 @@ func main() {
 	hKey, hVal := helper.ParseHeaderFlag(header)
 
 	// ---- Browser Context with HAR ----
-	ctx, err := browser.NewContext(pw.BrowserNewContextOptions{
+	browserCtx, err := browser.NewContext(pw.BrowserNewContextOptions{
 		RecordHarPath: pw.String(harPath),
 		RecordHarMode: pw.HarModeFull,
 		ExtraHttpHeaders: map[string]string{
@@ -69,18 +76,21 @@ func main() {
 		log.Fatal(err)
 	}
 
+	browserCtx.SetDefaultTimeout(float64(30000)) // 30s
+	browserCtx.SetDefaultNavigationTimeout(float64(time.Duration(totalTimeout) * time.Second))
+
 	// TODO implement timeout from arguments
 	// timeout := time.Duration(totalTimeout) * time.Second
 	// ctx, cancel := context.WithTimeout(ctx, timeout)
 	// defer cancel()
 
-	page, err := ctx.NewPage()
+	page, err := browserCtx.NewPage()
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	// ---- CAPTURE (navigate + JS triggers) ----
-	if err := capture.CaptureRequests(ctx, page, targetURL); err != nil {
+	if err = capture.CaptureRequests(ctxGlobal, page, targetURL); err != nil {
 		log.Fatal(err)
 	}
 
@@ -93,9 +103,24 @@ func main() {
 	// loop over har file and remove response objects. add scraped objects and unique the requests
 
 	// ---- Close so HAR gets written ----
-	if err := ctx.Close(); err != nil {
+	if err = browserCtx.Close(); err != nil {
 		log.Fatal(err)
 	}
 
+	log.Printf("Done. HAR will now be deduplicated and minified")
+	entries, err := helper.LoadHAREntriesStreaming(harPath)
+	if err != nil {
+		panic(err)
+	}
+
+	deduped, err := helper.DeduplicateHAREntries(entries, targetURL)
+	if err != nil {
+		panic(err)
+	}
+
+	err = helper.WriteHAR(harPath+"_deduped.har", deduped)
+	if err != nil {
+		panic(err)
+	}
 	log.Printf("Done. HAR saved at: %s", harPath)
 }

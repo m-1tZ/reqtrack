@@ -2,18 +2,13 @@ package scrape
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
-	"os"
+	"log"
 	"strings"
-	"time"
 
-	"github.com/chromedp/chromedp"
 	"github.com/m-1tZ/reqtrack/pkg/helper"
 	"github.com/m-1tZ/reqtrack/pkg/structs"
+	pw "github.com/playwright-community/playwright-go"
 	sitter "github.com/smacker/go-tree-sitter"
 	"github.com/smacker/go-tree-sitter/javascript"
 )
@@ -21,56 +16,105 @@ import (
 // ScrapeHtml will try to collect inline & external script sources from the current page context.
 // IMPORTANT: it will first try to read document.scripts (so it will NOT navigate if the page is already loaded).
 // If that yields nothing, it falls back to navigating targetURL once.
-func ScrapeRequests(ctx pw.BrowserContext, page pw.Page, targetURL string) error
-	var scripts []string
+func ScrapeRequests(
+	ctxGlobal context.Context,
+	page pw.Page,
+	browserCtx pw.BrowserContext,
+	targetURL string,
+) (*[]structs.HAREntry, error) {
 
-	// Navigate and wait for network to be idle
+	// ---------------------------------------------------------
+	// 1) Navigate (Playwright handles timeout)
+	// ---------------------------------------------------------
 	_, err := page.Goto(targetURL, pw.PageGotoOptions{
 		WaitUntil: pw.WaitUntilStateNetworkidle,
 	})
 	if err != nil {
-		return fmt.Errorf("goto failed: %w", err)
+		return nil, fmt.Errorf("goto failed: %w", err)
 	}
 
-	// try to read scripts from already-loaded page
-	err := chromedp.Run(navCtx,
-		chromedp.Evaluate(`Array.from(document.scripts).map(s => s.src ? s.src : s.innerText);`, &scripts),
-	)
-	if err != nil || len(scripts) == 0 {
-		// fallback: navigate once and get scripts
-		if err := chromedp.Run(navCtx,
-			chromedp.Navigate(targetURL),
-			chromedp.Evaluate(`Array.from(document.scripts).map(s => s.src ? s.src : s.innerText);`, &scripts),
-			chromedp.WaitReady("body", chromedp.ByQuery),
-		); err != nil {
-			return nil, err
-		}
+	if err := ctxGlobal.Err(); err != nil {
+		return nil, fmt.Errorf("global timeout hit after navigation: %w", err)
 	}
 
-	var all []*structs.RequestEntry
+	// ---------------------------------------------------------
+	// 2) Extract <script> contents & URLs from DOM
+	// ---------------------------------------------------------
+	var scriptList []string
+	_, err = page.Evaluate(`() => {
+        return Array.from(document.scripts).map(s =>
+            s.src ? s.src : s.textContent
+        );
+    }`, &scriptList, pw.PageWaitForLoadStateOptions{
+		State: pw.LoadStateNetworkidle,
+	})
 
-	for _, js := range scripts {
-		if js == "" {
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract scripts: %w", err)
+	}
+
+	// ---------------------------------------------------------
+	// 3) Fetch external JS via Playwright (keeps proxy/headers/cookies)
+	// ---------------------------------------------------------
+	request := browserCtx.Request()
+
+	combinedScripts := make([]string, 0, len(scriptList))
+
+	for _, item := range scriptList {
+		if strings.TrimSpace(item) == "" {
 			continue
 		}
-		if strings.HasPrefix(js, "http") {
-			resp, err := http.Get(js)
+
+		if strings.HasPrefix(item, "http://") || strings.HasPrefix(item, "https://") {
+			// Fetch through Playwright's network stack
+			// TODO ignore tls verify and have a timeout
+			resp, err := request.Get(item)
+			if err != nil {
+				log.Printf("Failed to fetch external JS %s: %v", item, err)
+				continue
+			}
+			txt, err := resp.Text()
 			if err != nil {
 				continue
 			}
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			js = string(body)
+			combinedScripts = append(combinedScripts, txt)
+		} else {
+			// Inline JS
+			combinedScripts = append(combinedScripts, item)
 		}
-		// Main logic
-		findings, _ := findHttpPrimitives(ctx, js)
+	}
+
+	// ---------------------------------------------------------
+	// 4) Run tree-sitter static JS detection on each JS script
+	// ---------------------------------------------------------
+	// TODO does this really work with the scripts?
+	var all []*structs.HAREntry
+	for _, js := range combinedScripts {
+		if js == "" {
+			continue
+		}
+
+		findings, err := findHttpPrimitives(context.Background(), js)
+		if err != nil {
+			log.Printf("tree-sitter error: %v", err)
+			continue
+		}
 		all = append(all, findings...)
 	}
+
+	// ---------------------------------------------------------
+	// 5) Normalize & dedupe just like your original code
+	// ---------------------------------------------------------
+	// TODO
+	//results := dedupeAndNormalize(all, targetURL)
+
 	return all, nil
 }
 
+// TODO HAR entry
+
 // ---- Tree-sitter static JS detection ----
-func findHttpPrimitives(ctx context.Context, jsCode string) ([]*structs.RequestEntry, error) {
+func findHttpPrimitives(ctx context.Context, jsCode string) ([]*structs.HAREntry, error) {
 	parser := sitter.NewParser()
 	parser.SetLanguage(javascript.GetLanguage())
 
@@ -80,7 +124,7 @@ func findHttpPrimitives(ctx context.Context, jsCode string) ([]*structs.RequestE
 	}
 
 	root := tree.RootNode()
-	var results []*structs.RequestEntry
+	var results []*structs.HAREntry
 	src := []byte(jsCode)
 
 	// --- helpers ---
@@ -120,42 +164,6 @@ func findHttpPrimitives(ctx context.Context, jsCode string) ([]*structs.RequestE
 			}
 		}
 		return ""
-	}
-
-	// Guess content type from body or explicit header.
-	guessContentType := func(explicitType, body, method string) string {
-		if explicitType != "" {
-			return explicitType
-		}
-		body = strings.TrimSpace(body)
-		if body == "" {
-			// No body -> only assign default if non-GET
-			if strings.EqualFold(method, "GET") || strings.EqualFold(method, "HEAD") {
-				return ""
-			}
-			return "application/x-www-form-urlencoded"
-		}
-
-		// Detect XML
-		if strings.HasPrefix(body, "<?xml version=") {
-			return "application/xml"
-		}
-
-		// Detect JSON
-		if (strings.HasPrefix(body, "{") && strings.HasSuffix(body, "}")) ||
-			(strings.HasPrefix(body, "[") && strings.HasSuffix(body, "]")) {
-			if json.Valid([]byte(body)) {
-				return "application/json"
-			}
-		}
-
-		// Detect form-encoded
-		if _, err := url.ParseQuery(body); err == nil && strings.Contains(body, "=") {
-			return "application/x-www-form-urlencoded"
-		}
-
-		// Fallback default
-		return "application/x-www-form-urlencoded"
 	}
 
 	// --- AST walker ---
@@ -297,32 +305,51 @@ func findHttpPrimitives(ctx context.Context, jsCode string) ([]*structs.RequestE
 						method = "GET"
 					}
 
-					// Guess content type if missing
-					ctype = guessContentType(ctype, body, method)
-
-					req := &structs.RequestEntry{
-						URL:         url,
-						Method:      method,
-						ContentType: ctype,
-						Headers:     map[string]string{},
+					entry := &structs.HAREntry{
+						Request: structs.HARRequest{
+							Method:      method,
+							URL:         url,
+							HTTPVersion: "HTTP/1.1",
+							Cookies:     []structs.HARCookie{},
+							Headers:     []structs.HARNameValue{},
+							Query:       []structs.HARNameValue{},
+							PostData:    nil,
+							HeaderSize:  -1,
+							BodySize:    -1,
+						},
 					}
+
+					// Guess content type if missing
+					ctype = helper.GuessContentType(ctype, body, method)
+
+					// if ctype != "" {
+					// 	entry.Request.Headers = append(entry.Request.Headers, structs.HARNameValue{
+					// 		Name:  "Content-Type",
+					// 		Value: ctype,
+					// 	})
+					// }
 
 					// Fill query params if any
 					if strings.Contains(url, "?") {
-						req.QueryParams = helper.ParseQueryParams(url)
+						qp := helper.ParseQueryParams(url)
+						for _, v := range qp {
+							entry.Request.Query = append(entry.Request.Query, structs.HARNameValue{
+								Name:  v.Name,
+								Value: v.Value,
+							})
+						}
 					}
 
 					// Fill post data entries if available
 					if body != "" {
-						req.PostDataEntries = []*structs.BodyDataEntryExtended{
-							{
-								Bytes:       fmt.Sprintf("%d", len(body)),
-								DecodedText: body,
-							},
+						entry.Request.PostData = &structs.HARPostData{
+							MimeType: ctype,
+							Text:     body,
 						}
+						entry.Request.BodySize = len(body)
 					}
 
-					results = append(results, req)
+					results = append(results, entry)
 				}
 			}
 		}
@@ -334,119 +361,5 @@ func findHttpPrimitives(ctx context.Context, jsCode string) ([]*structs.RequestE
 
 	walk(root)
 
-	// --- Deduplicate identical requests and remove empty URL ---
-	type reqKey struct {
-		Method string
-		URL    string
-		Body   string
-	}
-
-	seen := make(map[reqKey]bool)
-	var deduped []*structs.RequestEntry
-
-	targetURL := ctx.Value("targetURL").(string)
-	parsedBase, _ := url.Parse(targetURL)
-	baseOrigin := parsedBase.Scheme + "://" + parsedBase.Host
-
-	for _, r := range results {
-		if r.URL == "" {
-			continue
-		}
-
-		// Sanitize and normalize URLs (if variable ${} and then /<path>, just remove and pretend to target the root of the current origin) such as
-		// "url": "${f.getAuthServiceUrl()}/userinfo?origin=client",
-		// "url": "${(0,Vl.pN)(\"/_/api/commerce/prod\")}/shop/init-transaction/datatrans",
-		// "url": "/assets/files/lawyers/Anwaltsnetz_Tabelle.json",
-		// "url": "http://localhost:3000/external-executed",
-
-		// We always want absolute URLs, not relativ - thus get the targetURL and take the scheme + host and append relative
-		key := reqKey{
-			Method: r.Method,
-			URL:    helper.SanitizeURL(r.URL, baseOrigin), // r.URL
-		}
-		if len(r.PostDataEntries) > 0 {
-			key.Body = r.PostDataEntries[0].DecodedText
-		}
-		if !seen[key] {
-			seen[key] = true
-			// Not just above in the dedupe key, also overwrite URL with sanitized URL
-			r.URL = helper.SanitizeURL(r.URL, baseOrigin)
-			deduped = append(deduped, r)
-		}
-	}
-
 	return deduped, nil
-}
-
-// // ---- Patch HAR with static entries ----
-// if err := addStaticEntriesToHar(harPath); err != nil {
-// 	log.Fatal(err)
-// }
-
-func addStaticEntriesToHar(path string) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-
-	var har map[string]interface{}
-	if err := json.Unmarshal(data, &har); err != nil {
-		return err
-	}
-
-	// Detailed HAR spec root keys:
-	// har["log"].(map[string]interface{})["entries"].([]interface{})
-
-	logObj, ok := har["log"].(map[string]interface{})
-	if !ok {
-		return nil
-	}
-
-	entries, ok := logObj["entries"].([]interface{})
-	if !ok {
-		return nil
-	}
-
-	// ---- YOUR STATIC HAR ENTRY PLACEHOLDER ----
-	staticEntry := map[string]interface{}{
-		"startedDateTime": "2025-01-01T00:00:00.000Z",
-		"time":            0,
-		"request": map[string]interface{}{
-			"method":      "GET",
-			"url":         "https://example.com/static-found",
-			"httpVersion": "HTTP/1.1",
-			"headers":     []interface{}{},
-			"queryString": []interface{}{},
-			"cookies":     []interface{}{},
-			"headersSize": -1,
-			"bodySize":    0,
-		},
-		"response": map[string]interface{}{
-			"status":      0,
-			"statusText":  "",
-			"httpVersion": "HTTP/1.1",
-			"headers":     []interface{}{},
-			"cookies":     []interface{}{},
-			"content": map[string]interface{}{
-				"size":     0,
-				"mimeType": "text/plain",
-			},
-			"redirectURL": "",
-			"headersSize": -1,
-			"bodySize":    0,
-		},
-		"cache": map[string]interface{}{},
-		"timings": map[string]interface{}{
-			"send":    0,
-			"wait":    0,
-			"receive": 0,
-		},
-	}
-
-	// Append new entry to HAR
-	logObj["entries"] = append(entries, staticEntry)
-
-	// Rewrite HAR file
-	pretty, _ := json.MarshalIndent(har, "", "  ")
-	return os.WriteFile(path, pretty, 0644)
 }

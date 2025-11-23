@@ -1,14 +1,26 @@
 package capture
 
 import (
+	"context"
 	"fmt"
 	"log"
 
 	pw "github.com/playwright-community/playwright-go"
 )
 
-func CaptureRequests(ctx pw.BrowserContext, page pw.Page, targetURL string) error {
-	// Navigate and wait for network to be idle
+func CaptureRequests(
+	ctxGlobal context.Context,
+	page pw.Page,
+	targetURL string,
+) error {
+	// Stop immediately if global timeout already fired
+	if err := ctxGlobal.Err(); err != nil {
+		return fmt.Errorf("global timeout hit before navigation: %w", err)
+	}
+
+	// -------------------------------------------
+	// NAVIGATION
+	// -------------------------------------------
 	_, err := page.Goto(targetURL, pw.PageGotoOptions{
 		WaitUntil: pw.WaitUntilStateNetworkidle,
 	})
@@ -16,60 +28,39 @@ func CaptureRequests(ctx pw.BrowserContext, page pw.Page, targetURL string) erro
 		return fmt.Errorf("goto failed: %w", err)
 	}
 
-	// Execute your JS trigger
+	if err := ctxGlobal.Err(); err != nil {
+		return fmt.Errorf("global timeout hit after navigation: %w", err)
+	}
+
+	// -------------------------------------------
+	// TRIGGER JS
+	// -------------------------------------------
 	triggerJS := getTriggerJS()
-	if _, err := page.Evaluate(triggerJS); err != nil {
-		log.Println("Trigger script error:", err)
+	_, err = page.Evaluate(triggerJS, pw.PageWaitForLoadStateOptions{
+		State: pw.LoadStateNetworkidle,
+	})
+	if err != nil {
+		// Non-fatal — log & keep going
+		log.Printf("JS trigger execution failed: %v", err)
 	}
 
-	// Wait for triggered network calls to settle
-	// TODO wait for state WaitUntilStateNetworkidle
-	if err := page.WaitForLoadState(); err != nil {
-		return fmt.Errorf("wait for networkidle failed: %w", err)
+	if err := ctxGlobal.Err(); err != nil {
+		return fmt.Errorf("global timeout hit after JS trigger: %w", err)
 	}
 
-	return nil
+	// -------------------------------------------
+	// WAIT FOR NETWORKIDLE (after JS)
+	// -------------------------------------------
+	err = page.WaitForLoadState(
+		pw.PageWaitForLoadStateOptions{
+			State: pw.LoadStateNetworkidle,
+		})
+	if err != nil {
+		return fmt.Errorf("wait for network idle failed: %w", err)
+	}
+
+	return ctxGlobal.Err() // final global timeout check
 }
-
-// func CaptureRequests(ctx context.Context, browserContext pw.BrowserContext, page pw.Page, targetURL string, timeout time.Duration) error {
-// 	// Navigate and wait for network to be idle
-// 	_, err := page.Goto(targetURL, pw.PageGotoOptions{
-// 		WaitUntil: pw.WaitUntilStateNetworkidle,
-// 	})
-// 	if err != nil {
-// 		return fmt.Errorf("goto failed: %w", err)
-// 	}
-
-// 	// Execute your JS trigger with timeout
-// 	triggerJS := getTriggerJS()
-// 	done := make(chan error, 1)
-// 	go func() {
-// 		_, err := page.Evaluate(triggerJS)
-// 		done <- err
-// 	}()
-
-// 	select {
-// 	case <-ctx.Done():
-// 		return fmt.Errorf("context cancelled or timed out before JS trigger finished")
-// 	case err := <-done:
-// 		if err != nil {
-// 			return fmt.Errorf("trigger script error: %w", err)
-// 		}
-// 	}
-
-// 	// Wait for triggered network calls to settle
-// 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
-// 	defer cancel()
-
-// 	if err := page.WaitForLoadState(pw.PageWaitForLoadStateOptions{
-// 		State:   pw.WaitUntilStateNetworkidle,
-// 		Timeout: timeout.Milliseconds(),
-// 	}); err != nil {
-// 		return fmt.Errorf("wait for networkidle failed: %w", err)
-// 	}
-
-// 	return nil
-// }
 
 func getTriggerJS() string {
 	return `(function() {
