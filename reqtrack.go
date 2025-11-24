@@ -3,11 +3,12 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"time"
 
-	"github.com/m-1tZ/reqtrack/pkg/capture"
 	"github.com/m-1tZ/reqtrack/pkg/helper"
+	"github.com/m-1tZ/reqtrack/pkg/scrape"
 	pw "github.com/playwright-community/playwright-go"
 )
 
@@ -76,8 +77,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	browserCtx.SetDefaultTimeout(float64(30000)) // 30s
-	browserCtx.SetDefaultNavigationTimeout(float64(time.Duration(totalTimeout) * time.Second))
+	browserCtx.SetDefaultTimeout(float64((30 * time.Second) / time.Millisecond)) // 30s
+	browserCtx.SetDefaultNavigationTimeout(float64((time.Duration(totalTimeout) * time.Second) / time.Millisecond))
 
 	// TODO implement timeout from arguments
 	// timeout := time.Duration(totalTimeout) * time.Second
@@ -90,14 +91,17 @@ func main() {
 	}
 
 	// ---- CAPTURE (navigate + JS triggers) ----
-	if err = capture.CaptureRequests(ctxGlobal, page, targetURL); err != nil {
-		log.Fatal(err)
-	}
-
-	// ---- SCRAPE (static / heuristics) ----
-	// if err := ScrapeRequests(ctx, page); err != nil {
+	// if err = capture.CaptureRequests(ctxGlobal, page, targetURL); err != nil {
 	// 	log.Fatal(err)
 	// }
+
+	// ---- SCRAPE (static / heuristics) ----
+	scrapeHarEntries, err := scrape.ScrapeRequests(ctxGlobal, page, browserCtx, targetURL)
+	if err != nil {
+		log.Fatal(err)
+	}
+	// TODO use this and merge with captured har
+	fmt.Println(scrapeHarEntries)
 
 	// Scrape results can only be integrated if .har file was written
 	// loop over har file and remove response objects. add scraped objects and unique the requests
@@ -110,17 +114,19 @@ func main() {
 	log.Printf("Done. HAR will now be deduplicated and minified")
 	entries, err := helper.LoadHAREntriesStreaming(harPath)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
+
+	// TODO integrate scrapeHarEntries
 
 	deduped, err := helper.DeduplicateHAREntries(entries, targetURL)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 
 	err = helper.WriteHAR(harPath+"_deduped.har", deduped)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 	log.Printf("Done. HAR saved at: %s", harPath)
 }
