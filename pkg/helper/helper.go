@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/m-1tZ/reqtrack/pkg/structs"
@@ -28,17 +29,17 @@ func SanitizeURL(raw, baseOrigin string) string {
 	u := raw
 
 	// --- remove ${...} template expressions entirely ---
-	for {
-		start := strings.Index(u, "${")
-		if start == -1 {
-			break
-		}
-		end := strings.Index(u[start:], "}")
-		if end == -1 {
-			break
-		}
-		u = u[:start] + u[start+end+1:]
+	// for {
+	start := strings.Index(u, "${")
+	if start != -1 {
+		return ""
 	}
+	// end := strings.Index(u[start:], "}")
+	// if end == -1 {
+	// 	break
+	// }
+	// u = u[:start] + u[start+end+1:]
+	// }
 
 	u = strings.TrimSpace(u)
 
@@ -56,7 +57,7 @@ func SanitizeURL(raw, baseOrigin string) string {
 	}
 	u = string(cleaned)
 
-	// TODO sanitized version is not returned
+	//  sanitized version is not returned
 	//fmt.Println(u)
 
 	if u == "" {
@@ -106,42 +107,152 @@ func ParseQueryParams(rawURL string) []structs.Param {
 	return result
 }
 
-// Guess content type from body or explicit header.
-// TODO improve
+// Guess content type using static analysis + heuristics.
 func GuessContentType(explicitType string, body string, method string) string {
-
+	// --- 1) Explicit Content-Type always wins ---
 	if explicitType != "" {
 		return explicitType
 	}
+
+	// --- 2) No body: assign default only for non-GET/HEAD ---
 	body = strings.TrimSpace(body)
 	if body == "" {
-		// No body -> only assign default if non-GET
 		if strings.EqualFold(method, "GET") || strings.EqualFold(method, "HEAD") {
 			return ""
 		}
 		return "application/x-www-form-urlencoded"
 	}
 
-	// Detect XML
-	if strings.HasPrefix(body, "<?xml version=") {
-		return "application/xml"
+	// --- 3) Detect JSON from common JS patterns ---
+
+	// JSON.stringify(...)
+	if strings.Contains(body, "JSON.stringify") {
+		return "application/json"
 	}
 
-	// Detect JSON
-	if (strings.HasPrefix(body, "{") && strings.HasSuffix(body, "}")) ||
+	// JS object/array literal (static)
+	if (strings.HasPrefix(body, "{") && strings.Contains(body, ":")) ||
 		(strings.HasPrefix(body, "[") && strings.HasSuffix(body, "]")) {
-		if json.Valid([]byte(body)) {
-			return "application/json"
-		}
+		return "application/json"
 	}
 
-	// Detect form-encoded
-	if _, err := url.ParseQuery(body); err == nil && strings.Contains(body, "=") {
+	// Strict literal JSON
+	if json.Valid([]byte(body)) {
+		return "application/json"
+	}
+
+	// --- 4) Detect FormData() ---
+	if strings.Contains(body, "FormData(") {
+		return "multipart/form-data"
+	}
+
+	// --- 5) Detect URLSearchParams() ---
+	if strings.Contains(body, "URLSearchParams(") {
 		return "application/x-www-form-urlencoded"
 	}
 
-	// Fallback default
+	// --- 6) Detect Blob/File types ---
+	if strings.Contains(body, "new Blob(") || strings.Contains(body, "new File(") {
+		// Try to extract explicit type: { type: "..." }
+		if idx := strings.Index(body, "type"); idx != -1 {
+			if colon := strings.Index(body[idx:], ":"); colon != -1 {
+				rest := body[idx+colon+1:]
+				t := extractFirstQuotedString(rest)
+				if t != "" {
+					return t
+				}
+			}
+		}
+		return "application/octet-stream"
+	}
+
+	// --- 7) Detect XML content ---
+	if strings.HasPrefix(body, "<?xml") {
+		return "application/xml"
+	}
+	if looksLikeXML(body) {
+		return "application/xml"
+	}
+
+	// --- 8) Detect base64 → binary ---
+	if isLikelyBase64(body) {
+		return "application/octet-stream"
+	}
+
+	// --- 9) Detect form-urlencoded ---
+	if isLikelyFormURLEncoded(body) {
+		return "application/x-www-form-urlencoded"
+	}
+
+	// --- 10) Fallback ---
 	return "application/x-www-form-urlencoded"
+}
+
+// Detect very likely XML but not HTML.
+func looksLikeXML(s string) bool {
+	if !strings.HasPrefix(s, "<") {
+		return false
+	}
+	if strings.HasPrefix(s, "<html") || strings.HasPrefix(s, "<!DOCTYPE html") {
+		return false
+	}
+	return strings.Contains(s, "</")
+}
+
+// Extract first quoted string from snippet: "value"
+func extractFirstQuotedString(src string) string {
+	for _, q := range []string{`"`, `'`} {
+		start := strings.Index(src, q)
+		if start == -1 {
+			continue
+		}
+		end := strings.Index(src[start+1:], q)
+		if end == -1 {
+			continue
+		}
+		return src[start+1 : start+1+end]
+	}
+	return ""
+}
+
+// Base64 heuristic (static)
+func isLikelyBase64(s string) bool {
+	s = strings.TrimSpace(s)
+	if len(s) < 20 {
+		return false
+	}
+	if !regexp.MustCompile(`^[A-Za-z0-9+/=]+$`).MatchString(s) {
+		return false
+	}
+	// Ends with "=" padding
+	return strings.HasSuffix(s, "=") || strings.HasSuffix(s, "==")
+}
+
+// Form-URL-Encoded heuristic
+func isLikelyFormURLEncoded(s string) bool {
+	if !strings.Contains(s, "=") {
+		return false
+	}
+	if strings.Contains(s, "{") || strings.Contains(s, "[") {
+		return false
+	}
+	parts := strings.Split(s, "&")
+	for _, p := range parts {
+		if !strings.Contains(p, "=") {
+			return false
+		}
+	}
+	return true
+}
+
+// Merge scraped HAR entries with loaded HAR entries.
+// Scraped entries come without response objects, but that’s fine – we only keep Request anyway.
+func MergeHAREntries(base []*structs.HAREntry, scraped []*structs.HAREntry) []*structs.HAREntry {
+	// Just append – dedupe happens later
+	merged := make([]*structs.HAREntry, 0, len(base)+len(scraped))
+	merged = append(merged, base...)
+	merged = append(merged, scraped...)
+	return merged
 }
 
 // DeduplicateEntries removes duplicate HAR entries based on request key

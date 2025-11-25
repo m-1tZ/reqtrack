@@ -1,7 +1,6 @@
 package capture
 
 import (
-	"context"
 	"fmt"
 	"log"
 
@@ -9,14 +8,9 @@ import (
 )
 
 func CaptureRequests(
-	ctxGlobal context.Context,
 	page pw.Page,
 	targetURL string,
 ) error {
-	// Stop immediately if global timeout already fired
-	if err := ctxGlobal.Err(); err != nil {
-		return fmt.Errorf("global timeout hit before navigation: %w", err)
-	}
 
 	// -------------------------------------------
 	// NAVIGATION
@@ -26,10 +20,6 @@ func CaptureRequests(
 	})
 	if err != nil {
 		return fmt.Errorf("goto failed: %w", err)
-	}
-
-	if err := ctxGlobal.Err(); err != nil {
-		return fmt.Errorf("global timeout hit after navigation: %w", err)
 	}
 
 	// -------------------------------------------
@@ -44,10 +34,6 @@ func CaptureRequests(
 		log.Printf("JS trigger execution failed: %v", err)
 	}
 
-	if err := ctxGlobal.Err(); err != nil {
-		return fmt.Errorf("global timeout hit after JS trigger: %w", err)
-	}
-
 	// -------------------------------------------
 	// WAIT FOR NETWORKIDLE (after JS)
 	// -------------------------------------------
@@ -59,7 +45,7 @@ func CaptureRequests(
 		return fmt.Errorf("wait for network idle failed: %w", err)
 	}
 
-	return ctxGlobal.Err() // final global timeout check
+	return nil
 }
 
 func getTriggerJS() string {

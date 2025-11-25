@@ -1,12 +1,11 @@
 package main
 
 import (
-	"context"
 	"flag"
-	"fmt"
 	"log"
 	"time"
 
+	"github.com/m-1tZ/reqtrack/pkg/capture"
 	"github.com/m-1tZ/reqtrack/pkg/helper"
 	"github.com/m-1tZ/reqtrack/pkg/scrape"
 	pw "github.com/playwright-community/playwright-go"
@@ -15,7 +14,6 @@ import (
 func main() {
 	var targetURL string
 	var header string
-	var totalTimeout float64
 	var navTimeout float64
 	var proxy string
 	var harPath string
@@ -24,8 +22,7 @@ func main() {
 		"User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:144.0) Gecko/20100101 Firefox/144.0",
 		"Custom header")
 	flag.StringVar(&targetURL, "u", "", "URL to process")
-	flag.Float64Var(&totalTimeout, "ttotal", 60, "Timeout for the total processing (default 60s)")
-	flag.Float64Var(&navTimeout, "tnav", 7, "Timeout for navigation and script evaluation (default 7s)")
+	flag.Float64Var(&navTimeout, "t", 7, "Timeout for navigation and script evaluation (default 7s)")
 	flag.StringVar(&proxy, "p", "", "Optional proxy (http://127.0.0.1:8080)")
 	flag.StringVar(&harPath, "har", "traffic.har", "HAR output file")
 
@@ -34,10 +31,6 @@ func main() {
 	if targetURL == "" {
 		log.Fatal("Missing -u URL")
 	}
-
-	ctxGlobal, cancel := context.WithTimeout(context.Background(),
-		time.Duration(totalTimeout)*time.Second)
-	defer cancel()
 
 	// ---- Playwright Setup ----
 	// if err := pw.Install(); err != nil {
@@ -77,13 +70,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	browserCtx.SetDefaultTimeout(float64((30 * time.Second) / time.Millisecond)) // 30s
-	browserCtx.SetDefaultNavigationTimeout(float64((time.Duration(totalTimeout) * time.Second) / time.Millisecond))
-
-	// TODO implement timeout from arguments
-	// timeout := time.Duration(totalTimeout) * time.Second
-	// ctx, cancel := context.WithTimeout(ctx, timeout)
-	// defer cancel()
+	// browserCtx.SetDefaultTimeout(float64((2 * time.Second) / time.Millisecond)) // 30s
+	browserCtx.SetDefaultNavigationTimeout(float64((time.Duration(navTimeout) * time.Second) / time.Millisecond))
 
 	page, err := browserCtx.NewPage()
 	if err != nil {
@@ -91,17 +79,15 @@ func main() {
 	}
 
 	// ---- CAPTURE (navigate + JS triggers) ----
-	// if err = capture.CaptureRequests(ctxGlobal, page, targetURL); err != nil {
-	// 	log.Fatal(err)
-	// }
+	if err = capture.CaptureRequests(page, targetURL); err != nil {
+		log.Fatal(err)
+	}
 
 	// ---- SCRAPE (static / heuristics) ----
-	scrapeHarEntries, err := scrape.ScrapeRequests(ctxGlobal, page, browserCtx, targetURL)
+	scrapeHarEntries, err := scrape.ScrapeRequests(page, browserCtx, targetURL)
 	if err != nil {
 		log.Fatal(err)
 	}
-	// TODO use this and merge with captured har
-	fmt.Println(scrapeHarEntries)
 
 	// Scrape results can only be integrated if .har file was written
 	// loop over har file and remove response objects. add scraped objects and unique the requests
@@ -117,9 +103,10 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// TODO integrate scrapeHarEntries
+	// ---- MERGE SCRAPED + HAR LOADED ----
+	merged := helper.MergeHAREntries(entries, scrapeHarEntries)
 
-	deduped, err := helper.DeduplicateHAREntries(entries, targetURL)
+	deduped, err := helper.DeduplicateHAREntries(merged, targetURL)
 	if err != nil {
 		log.Fatal(err)
 	}

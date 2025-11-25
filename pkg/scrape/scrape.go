@@ -18,10 +18,10 @@ import (
 // IMPORTANT: it will first try to read document.scripts (so it will NOT navigate if the page is already loaded).
 // If that yields nothing, it falls back to navigating targetURL once.
 func ScrapeRequests(
-	ctxGlobal context.Context,
 	page pw.Page,
 	browserCtx pw.BrowserContext,
 	targetURL string,
+	navTimeout string,
 ) ([]*structs.HAREntry, error) {
 
 	// ---------------------------------------------------------
@@ -38,10 +38,6 @@ func ScrapeRequests(
 	// if err := page.WaitForLoadState(pw.LoadStateDOMContentLoaded); err != nil {
 	// 	return nil, err
 	// }
-
-	if err := ctxGlobal.Err(); err != nil {
-		return nil, fmt.Errorf("global timeout hit after navigation: %w", err)
-	}
 
 	// ---------------------------------------------------------
 	// 2) Extract <script> contents & URLs from DOM
@@ -77,6 +73,7 @@ func ScrapeRequests(
 			// Fetch through Playwright's network stack
 			// TODO ignore tls verify and have a timeout
 			resp, err := request.Get(item)
+
 			if err != nil {
 				log.Printf("Failed to fetch external JS %s: %v", item, err)
 				continue
@@ -115,7 +112,7 @@ func ScrapeRequests(
 	// Normalize HAR entries
 	results, err := helper.DeduplicateHAREntries(all, targetURL)
 	if err != nil {
-		log.Fatal(err)
+		return nil, fmt.Errorf("Error in DeduplicateHAREntries: %w", err)
 	}
 
 	return results, nil
@@ -123,6 +120,7 @@ func ScrapeRequests(
 
 // ---- Tree-sitter static JS detection ----
 func findHttpPrimitives(ctx context.Context, jsCode string) ([]*structs.HAREntry, error) {
+	// TODO parser could run OOM or hang - implement kill after x timeout
 	parser := sitter.NewParser()
 	parser.SetLanguage(javascript.GetLanguage())
 
@@ -304,6 +302,50 @@ func findHttpPrimitives(ctx context.Context, jsCode string) ([]*structs.HAREntry
 							}
 							ctype = extractObjectProperty(args[0], "Content-Type")
 							body = extractObjectProperty(args[0], "data")
+						}
+
+						if body == "" && len(args) >= 2 {
+							bodyNode := args[1]
+
+							switch bodyNode.Type() {
+
+							case "object":
+								ctype = "application/json"
+
+							case "array":
+								ctype = "application/json"
+
+							case "call_expression":
+								fn := bodyNode.ChildByFieldName("function")
+								if fn != nil {
+									fname := fn.Content(src)
+
+									if fname == "JSON.stringify" {
+										ctype = "application/json"
+									}
+									if fname == "FormData" {
+										ctype = "multipart/form-data"
+									}
+									if fname == "URLSearchParams" {
+										ctype = "application/x-www-form-urlencoded"
+									}
+									if fname == "atob" {
+										ctype = "application/octet-stream"
+									}
+								}
+
+							case "new_expression":
+								ctor := bodyNode.ChildByFieldName("constructor")
+								if ctor != nil {
+									cname := ctor.Content(src)
+									if cname == "FormData" {
+										ctype = "multipart/form-data"
+									}
+									if cname == "Blob" || cname == "File" {
+										ctype = "application/octet-stream"
+									}
+								}
+							}
 						}
 					}
 
