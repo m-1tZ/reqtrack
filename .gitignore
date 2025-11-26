@@ -33,3 +33,5 @@ go.work.sum
 
 tests
 scripts
+traffic.har
+.vscode

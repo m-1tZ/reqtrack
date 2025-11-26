@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/m-1tZ/reqtrack/pkg/helper"
 	"github.com/m-1tZ/reqtrack/pkg/structs"
@@ -21,7 +22,8 @@ func ScrapeRequests(
 	page pw.Page,
 	browserCtx pw.BrowserContext,
 	targetURL string,
-	navTimeout string,
+	navTimeout float64,
+	parseTimeout float64,
 ) ([]*structs.HAREntry, error) {
 
 	// ---------------------------------------------------------
@@ -71,8 +73,10 @@ func ScrapeRequests(
 
 		if strings.HasPrefix(item, "http://") || strings.HasPrefix(item, "https://") {
 			// Fetch through Playwright's network stack
-			// TODO ignore tls verify and have a timeout
-			resp, err := request.Get(item)
+			resp, err := request.Get(item, pw.APIRequestContextGetOptions{
+				Timeout:           pw.Float(navTimeout),
+				IgnoreHttpsErrors: pw.Bool(true),
+			})
 
 			if err != nil {
 				log.Printf("Failed to fetch external JS %s: %v", item, err)
@@ -98,7 +102,13 @@ func ScrapeRequests(
 			continue
 		}
 
-		findings, err := findHttpPrimitives(context.Background(), js)
+		// --- Skip JS > 4 MB ---
+		if len(js) > 4*1024*1024 {
+			log.Printf("skipping JS >4MB (%d bytes)", len(js))
+			continue
+		}
+
+		findings, err := findHttpPrimitives(context.Background(), js, parseTimeout)
 		if err != nil {
 			log.Printf("tree-sitter error: %v", err)
 			continue
@@ -119,297 +129,326 @@ func ScrapeRequests(
 }
 
 // ---- Tree-sitter static JS detection ----
-func findHttpPrimitives(ctx context.Context, jsCode string) ([]*structs.HAREntry, error) {
-	// TODO parser could run OOM or hang - implement kill after x timeout
-	parser := sitter.NewParser()
-	parser.SetLanguage(javascript.GetLanguage())
+func findHttpPrimitives(parentCtx context.Context, jsCode string, parseTimeout float64) ([]*structs.HAREntry, error) {
+	// --- apply timeout ---
+	ctx, cancel := context.WithTimeout(parentCtx, time.Duration(parseTimeout)*time.Second)
+	defer cancel()
 
-	tree, err := parser.ParseCtx(ctx, nil, []byte(jsCode))
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse JS code: %w", err)
+	// Channel for results
+	type result struct {
+		val []*structs.HAREntry
+		err error
 	}
+	ch := make(chan result, 1)
 
-	root := tree.RootNode()
-	var results []*structs.HAREntry
-	src := []byte(jsCode)
+	// --- worker routine ---
+	go func() {
 
-	// --- helpers ---
-	extractString := func(node *sitter.Node) string {
-		if node == nil {
+		parser := sitter.NewParser()
+		parser.SetLanguage(javascript.GetLanguage())
+
+		tree, err := parser.ParseCtx(ctx, nil, []byte(jsCode))
+		if err != nil {
+			ch <- result{nil, fmt.Errorf("failed to parse JS code: %w", err)}
+		}
+
+		root := tree.RootNode()
+		var results []*structs.HAREntry
+		src := []byte(jsCode)
+
+		// --- helpers ---
+		extractString := func(node *sitter.Node) string {
+			if node == nil {
+				return ""
+			}
+			switch node.Type() {
+			case "string":
+				return strings.Trim(node.Content([]byte(jsCode)), `"'`)
+			case "template_string":
+				return strings.Trim(node.Content([]byte(jsCode)), "`")
+			case "object":
+				// Raw object literal in place of string
+				return node.Content([]byte(jsCode))
+			}
 			return ""
 		}
-		switch node.Type() {
-		case "string":
-			return strings.Trim(node.Content([]byte(jsCode)), `"'`)
-		case "template_string":
-			return strings.Trim(node.Content([]byte(jsCode)), "`")
-		case "object":
-			// Raw object literal in place of string
-			return node.Content([]byte(jsCode))
-		}
-		return ""
-	}
 
-	var extractObjectProperty func(objNode *sitter.Node, propName string) string
-	extractObjectProperty = func(objNode *sitter.Node, propName string) string {
-		if objNode == nil || (objNode.Type() != "object" && objNode.Type() != "object_pattern") {
-			return ""
-		}
-		for i := 0; i < int(objNode.NamedChildCount()); i++ {
-			child := objNode.NamedChild(i)
-			if child.Type() == "pair" {
-				keyNode := child.ChildByFieldName("key")
-				valueNode := child.ChildByFieldName("value")
-				if keyNode != nil && strings.Trim(keyNode.Content([]byte(jsCode)), `"'`) == propName {
-					return extractString(valueNode)
-				}
-				// Special: headers.{Content-Type}
-				if keyNode != nil && strings.Trim(keyNode.Content([]byte(jsCode)), `"'`) == "headers" && valueNode.Type() == "object" {
-					return extractObjectProperty(valueNode, propName)
+		var extractObjectProperty func(objNode *sitter.Node, propName string) string
+		extractObjectProperty = func(objNode *sitter.Node, propName string) string {
+			if objNode == nil || (objNode.Type() != "object" && objNode.Type() != "object_pattern") {
+				return ""
+			}
+			for i := 0; i < int(objNode.NamedChildCount()); i++ {
+				child := objNode.NamedChild(i)
+				if child.Type() == "pair" {
+					keyNode := child.ChildByFieldName("key")
+					valueNode := child.ChildByFieldName("value")
+					if keyNode != nil && strings.Trim(keyNode.Content([]byte(jsCode)), `"'`) == propName {
+						return extractString(valueNode)
+					}
+					// Special: headers.{Content-Type}
+					if keyNode != nil && strings.Trim(keyNode.Content([]byte(jsCode)), `"'`) == "headers" && valueNode.Type() == "object" {
+						return extractObjectProperty(valueNode, propName)
+					}
 				}
 			}
-		}
-		return ""
-	}
-
-	// --- AST walker ---
-	var walk func(node *sitter.Node)
-	walk = func(node *sitter.Node) {
-		if node == nil {
-			return
+			return ""
 		}
 
-		if node.Type() == "call_expression" {
-			funcNode := node.ChildByFieldName("function")
-			if funcNode != nil {
-				funcName := funcNode.Content(src)
-				prim := ""
-				isFetch := false
-				isXHROpen := false
-				isXHRSend := false
+		// --- AST walker ---
+		var walk func(node *sitter.Node)
+		walk = func(node *sitter.Node) {
+			// abort if context expired
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 
-				switch funcNode.Type() {
-				case "identifier":
-					if funcName == "fetch" {
-						prim = "fetch"
-						isFetch = true
+			if node == nil {
+				return
+			}
+
+			if node.Type() == "call_expression" {
+				funcNode := node.ChildByFieldName("function")
+				if funcNode != nil {
+					funcName := funcNode.Content(src)
+					prim := ""
+					isFetch := false
+					isXHROpen := false
+					isXHRSend := false
+
+					switch funcNode.Type() {
+					case "identifier":
+						if funcName == "fetch" {
+							prim = "fetch"
+							isFetch = true
+						}
+						if funcName == "axios" {
+							prim = "axios"
+						}
+					case "member_expression":
+						obj := funcNode.ChildByFieldName("object")
+						prop := funcNode.ChildByFieldName("property")
+						if obj != nil && prop != nil {
+							// axios.<method>()
+							if obj.Content(src) == "axios" {
+								prim = "axios." + prop.Content(src)
+							}
+							// $.ajax(...)
+							if obj.Content(src) == "$" && prop.Content(src) == "ajax" {
+								prim = "$.ajax"
+							}
+							// XMLHttpRequest.open/send(...)
+							if prop.Content(src) == "open" {
+								prim = "XMLHttpRequest.open"
+								isXHROpen = true
+							}
+							if prop.Content(src) == "send" {
+								prim = "XMLHttpRequest.send"
+								isXHRSend = true
+							}
+						}
 					}
-					if funcName == "axios" {
-						prim = "axios"
-					}
-				case "member_expression":
-					obj := funcNode.ChildByFieldName("object")
-					prop := funcNode.ChildByFieldName("property")
-					if obj != nil && prop != nil {
-						// axios.<method>()
-						if obj.Content(src) == "axios" {
-							prim = "axios." + prop.Content(src)
-						}
-						// $.ajax(...)
-						if obj.Content(src) == "$" && prop.Content(src) == "ajax" {
-							prim = "$.ajax"
-						}
-						// XMLHttpRequest.open/send(...)
-						if prop.Content(src) == "open" {
-							prim = "XMLHttpRequest.open"
-							isXHROpen = true
-						}
-						if prop.Content(src) == "send" {
-							prim = "XMLHttpRequest.send"
-							isXHRSend = true
-						}
-					}
-				}
 
-				if prim != "" {
-					argsNode := node.ChildByFieldName("arguments")
-					var url, method, ctype, body string
+					if prim != "" {
+						argsNode := node.ChildByFieldName("arguments")
+						var url, method, ctype, body string
 
-					if argsNode != nil {
-						args := []*sitter.Node{}
-						for i := 0; i < int(argsNode.NamedChildCount()); i++ {
-							args = append(args, argsNode.NamedChild(i))
-						}
-
-						// --- fetch() ---
-						if isFetch {
-							if len(args) >= 1 {
-								url = extractString(args[0])
+						if argsNode != nil {
+							args := []*sitter.Node{}
+							for i := 0; i < int(argsNode.NamedChildCount()); i++ {
+								args = append(args, argsNode.NamedChild(i))
 							}
-							if len(args) >= 2 && args[1].Type() == "object" {
-								method = extractObjectProperty(args[1], "method")
-								ctype = extractObjectProperty(args[1], "Content-Type")
-								body = extractObjectProperty(args[1], "body")
-							}
-						}
 
-						// --- XMLHttpRequest.open(method, url) ---
-						if isXHROpen {
-							if len(args) >= 2 {
-								method = extractString(args[0])
-								url = extractString(args[1])
-							}
-						}
-
-						// --- XMLHttpRequest.send(body) ---
-						if isXHRSend && len(args) >= 1 {
-							body = extractString(args[0])
-						}
-
-						// --- axios.post(...) / axios.get(...) etc. ---
-						if strings.HasPrefix(prim, "axios.") {
-							if len(args) >= 1 {
-								url = extractString(args[0])
-							}
-							if len(args) >= 2 {
-								method = strings.ToUpper(strings.TrimPrefix(prim, "axios."))
-
-								// Second argument is usually the body
-								if args[1].Type() == "object" || args[1].Type() == "array" {
-									body = args[1].Content(src)
+							// --- fetch() ---
+							if isFetch {
+								if len(args) >= 1 {
+									url = extractString(args[0])
 								}
-
-								// Third argument may be config
-								if len(args) >= 3 && args[2].Type() == "object" {
-									ctype = extractObjectProperty(args[2], "Content-Type")
+								if len(args) >= 2 && args[1].Type() == "object" {
+									method = extractObjectProperty(args[1], "method")
+									ctype = extractObjectProperty(args[1], "Content-Type")
+									body = extractObjectProperty(args[1], "body")
 								}
 							}
-						}
 
-						// --- axios({ url, method, data, headers }) ---
-						if prim == "axios" {
-							if len(args) >= 1 && args[0].Type() == "object" {
+							// --- XMLHttpRequest.open(method, url) ---
+							if isXHROpen {
+								if len(args) >= 2 {
+									method = extractString(args[0])
+									url = extractString(args[1])
+								}
+							}
+
+							// --- XMLHttpRequest.send(body) ---
+							if isXHRSend && len(args) >= 1 {
+								body = extractString(args[0])
+							}
+
+							// --- axios.post(...) / axios.get(...) etc. ---
+							if strings.HasPrefix(prim, "axios.") {
+								if len(args) >= 1 {
+									url = extractString(args[0])
+								}
+								if len(args) >= 2 {
+									method = strings.ToUpper(strings.TrimPrefix(prim, "axios."))
+
+									// Second argument is usually the body
+									if args[1].Type() == "object" || args[1].Type() == "array" {
+										body = args[1].Content(src)
+									}
+
+									// Third argument may be config
+									if len(args) >= 3 && args[2].Type() == "object" {
+										ctype = extractObjectProperty(args[2], "Content-Type")
+									}
+								}
+							}
+
+							// --- axios({ url, method, data, headers }) ---
+							if prim == "axios" {
+								if len(args) >= 1 && args[0].Type() == "object" {
+									url = extractObjectProperty(args[0], "url")
+									method = extractObjectProperty(args[0], "method")
+									ctype = extractObjectProperty(args[0], "Content-Type")
+									body = extractObjectProperty(args[0], "data")
+								}
+								if len(args) >= 2 && args[1].Type() == "object" {
+									// axios(url, config)
+									url = extractString(args[0])
+									method = extractObjectProperty(args[1], "method")
+									ctype = extractObjectProperty(args[1], "Content-Type")
+									body = extractObjectProperty(args[1], "data")
+								}
+							}
+
+							// --- $.ajax({...}) ---
+							if prim == "$.ajax" && len(args) >= 1 && args[0].Type() == "object" {
 								url = extractObjectProperty(args[0], "url")
 								method = extractObjectProperty(args[0], "method")
+								if method == "" {
+									method = extractObjectProperty(args[0], "type")
+								}
 								ctype = extractObjectProperty(args[0], "Content-Type")
 								body = extractObjectProperty(args[0], "data")
 							}
-							if len(args) >= 2 && args[1].Type() == "object" {
-								// axios(url, config)
-								url = extractString(args[0])
-								method = extractObjectProperty(args[1], "method")
-								ctype = extractObjectProperty(args[1], "Content-Type")
-								body = extractObjectProperty(args[1], "data")
-							}
-						}
 
-						// --- $.ajax({...}) ---
-						if prim == "$.ajax" && len(args) >= 1 && args[0].Type() == "object" {
-							url = extractObjectProperty(args[0], "url")
-							method = extractObjectProperty(args[0], "method")
-							if method == "" {
-								method = extractObjectProperty(args[0], "type")
-							}
-							ctype = extractObjectProperty(args[0], "Content-Type")
-							body = extractObjectProperty(args[0], "data")
-						}
+							if body == "" && len(args) >= 2 {
+								bodyNode := args[1]
 
-						if body == "" && len(args) >= 2 {
-							bodyNode := args[1]
+								switch bodyNode.Type() {
 
-							switch bodyNode.Type() {
+								case "object":
+									ctype = "application/json"
 
-							case "object":
-								ctype = "application/json"
+								case "array":
+									ctype = "application/json"
 
-							case "array":
-								ctype = "application/json"
+								case "call_expression":
+									fn := bodyNode.ChildByFieldName("function")
+									if fn != nil {
+										fname := fn.Content(src)
 
-							case "call_expression":
-								fn := bodyNode.ChildByFieldName("function")
-								if fn != nil {
-									fname := fn.Content(src)
-
-									if fname == "JSON.stringify" {
-										ctype = "application/json"
+										if fname == "JSON.stringify" {
+											ctype = "application/json"
+										}
+										if fname == "FormData" {
+											ctype = "multipart/form-data"
+										}
+										if fname == "URLSearchParams" {
+											ctype = "application/x-www-form-urlencoded"
+										}
+										if fname == "atob" {
+											ctype = "application/octet-stream"
+										}
 									}
-									if fname == "FormData" {
-										ctype = "multipart/form-data"
-									}
-									if fname == "URLSearchParams" {
-										ctype = "application/x-www-form-urlencoded"
-									}
-									if fname == "atob" {
-										ctype = "application/octet-stream"
-									}
-								}
 
-							case "new_expression":
-								ctor := bodyNode.ChildByFieldName("constructor")
-								if ctor != nil {
-									cname := ctor.Content(src)
-									if cname == "FormData" {
-										ctype = "multipart/form-data"
-									}
-									if cname == "Blob" || cname == "File" {
-										ctype = "application/octet-stream"
+								case "new_expression":
+									ctor := bodyNode.ChildByFieldName("constructor")
+									if ctor != nil {
+										cname := ctor.Content(src)
+										if cname == "FormData" {
+											ctype = "multipart/form-data"
+										}
+										if cname == "Blob" || cname == "File" {
+											ctype = "application/octet-stream"
+										}
 									}
 								}
 							}
 						}
-					}
 
-					// Normalize method
-					method = strings.ToUpper(strings.TrimSpace(method))
-					if method == "" {
-						method = "GET"
-					}
-
-					entry := &structs.HAREntry{
-						Request: structs.HARRequest{
-							Method:      method,
-							URL:         url,
-							HTTPVersion: "HTTP/1.1",
-							Cookies:     []structs.HARCookie{},
-							Headers:     []structs.HARNameValue{},
-							Query:       []structs.HARNameValue{},
-							PostData:    nil,
-							HeaderSize:  -1,
-							BodySize:    -1,
-						},
-					}
-
-					// Guess content type if missing
-					ctype = helper.GuessContentType(ctype, body, method)
-
-					// if ctype != "" {
-					// 	entry.Request.Headers = append(entry.Request.Headers, structs.HARNameValue{
-					// 		Name:  "Content-Type",
-					// 		Value: ctype,
-					// 	})
-					// }
-
-					// Fill query params if any
-					if strings.Contains(url, "?") {
-						qp := helper.ParseQueryParams(url)
-						for _, v := range qp {
-							entry.Request.Query = append(entry.Request.Query, structs.HARNameValue{
-								Name:  v.Name,
-								Value: v.Value,
-							})
+						// Normalize method
+						method = strings.ToUpper(strings.TrimSpace(method))
+						if method == "" {
+							method = "GET"
 						}
-					}
 
-					// Fill post data entries if available
-					if body != "" {
-						entry.Request.PostData = &structs.HARPostData{
-							MimeType: ctype,
-							Text:     body,
+						entry := &structs.HAREntry{
+							Request: structs.HARRequest{
+								Method:      method,
+								URL:         url,
+								HTTPVersion: "HTTP/1.1",
+								Cookies:     []structs.HARCookie{},
+								Headers:     []structs.HARNameValue{},
+								Query:       []structs.HARNameValue{},
+								PostData:    nil,
+								HeaderSize:  -1,
+								BodySize:    -1,
+							},
 						}
-						entry.Request.BodySize = len(body)
-					}
 
-					results = append(results, entry)
+						// Guess content type if missing
+						ctype = helper.GuessContentType(ctype, body, method)
+
+						// if ctype != "" {
+						// 	entry.Request.Headers = append(entry.Request.Headers, structs.HARNameValue{
+						// 		Name:  "Content-Type",
+						// 		Value: ctype,
+						// 	})
+						// }
+
+						// Fill query params if any
+						if strings.Contains(url, "?") {
+							qp := helper.ParseQueryParams(url)
+							for _, v := range qp {
+								entry.Request.Query = append(entry.Request.Query, structs.HARNameValue{
+									Name:  v.Name,
+									Value: v.Value,
+								})
+							}
+						}
+
+						// Fill post data entries if available
+						if body != "" {
+							entry.Request.PostData = &structs.HARPostData{
+								MimeType: ctype,
+								Text:     body,
+							}
+							entry.Request.BodySize = len(body)
+						}
+
+						results = append(results, entry)
+					}
 				}
+			}
+
+			for i := 0; i < int(node.ChildCount()); i++ {
+				walk(node.Child(i))
 			}
 		}
 
-		for i := 0; i < int(node.ChildCount()); i++ {
-			walk(node.Child(i))
-		}
+		walk(root)
+		ch <- result{results, nil}
+	}()
+
+	// --- wait for worker ---
+	select {
+	case <-ctx.Done():
+		return nil, fmt.Errorf("JS parse timed out")
+	case res := <-ch:
+		return res.val, res.err
 	}
-
-	walk(root)
-
-	return results, nil
+	//return results, nil
 }

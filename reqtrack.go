@@ -14,6 +14,7 @@ import (
 func main() {
 	var targetURL string
 	var header string
+	var parseTimeout float64
 	var navTimeout float64
 	var proxy string
 	var harPath string
@@ -22,7 +23,8 @@ func main() {
 		"User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:144.0) Gecko/20100101 Firefox/144.0",
 		"Custom header")
 	flag.StringVar(&targetURL, "u", "", "URL to process")
-	flag.Float64Var(&navTimeout, "t", 7, "Timeout for navigation and script evaluation (default 7s)")
+	flag.Float64Var(&parseTimeout, "tparse", 30, "Timeout for parsing of scripts with AST (default 30s)")
+	flag.Float64Var(&navTimeout, "tnav", 7, "Timeout for navigation and script evaluation (default 7s)")
 	flag.StringVar(&proxy, "p", "", "Optional proxy (http://127.0.0.1:8080)")
 	flag.StringVar(&harPath, "har", "traffic.har", "HAR output file")
 
@@ -84,7 +86,7 @@ func main() {
 	}
 
 	// ---- SCRAPE (static / heuristics) ----
-	scrapeHarEntries, err := scrape.ScrapeRequests(page, browserCtx, targetURL)
+	scrapeHarEntries, err := scrape.ScrapeRequests(page, browserCtx, targetURL, float64((time.Duration(navTimeout)*time.Second)/time.Millisecond), parseTimeout)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -111,7 +113,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	err = helper.WriteHAR(harPath+"_deduped.har", deduped)
+	err = helper.WriteHAR(harPath, deduped)
 	if err != nil {
 		log.Fatal(err)
 	}
