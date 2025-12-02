@@ -43,4 +43,4 @@ $ cat traffic.har
 ```
 
 ## Known issues
-- Multipart requests are not properly logged in HAR files from Chromium as this is supposed to be a performance logging. See https://stackoverflow.com/questions/14953878/file-contents-of-multipart-file-upload-not-shown-in-har-http-archive-produced
+- Chromium itself does not expose the full multipart body through the DevTools Protocol, so chromedp cannot give you the full multipart payload. This is supposed to be performance logging, nothing else. For example see https://stackoverflow.com/questions/14953878/file-contents-of-multipart-file-upload-not-shown-in-har-http-archive-produced - a workaround will be implemented
