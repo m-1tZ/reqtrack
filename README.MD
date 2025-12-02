@@ -41,3 +41,6 @@ $ cat traffic.har
                 }
 ...
 ```
+
+## Known issues
+- Multipart requests are not properly logged in HAR files from Chromium as this is supposed to be a performance logging. See https://stackoverflow.com/questions/14953878/file-contents-of-multipart-file-upload-not-shown-in-har-http-archive-produced
