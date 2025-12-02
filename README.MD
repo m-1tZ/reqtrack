@@ -6,7 +6,7 @@ This approach is partially based on [RESTful API Inference](https://kilthub.cmu.
 
 ## Installation
 
-`go install github.com/m-1tZ/reqtrack`
+`go install github.com/m-1tZ/reqtrack@latest`
 
 ## Usage
 
