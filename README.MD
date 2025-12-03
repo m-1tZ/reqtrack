@@ -8,6 +8,15 @@ This approach is partially based on [RESTful API Inference](https://kilthub.cmu.
 
 `go install github.com/m-1tZ/reqtrack@latest`
 
+Playwright 1.52.0 is required. This is currently the latest version of golang with version `v0.5200.1`:
+
+```
+go run github.com/playwright-community/playwright-go/cmd/playwright@v0.5200.1 install --with-deps
+# Or
+go install github.com/playwright-community/playwright-go/cmd/playwright@v0.5200.1
+playwright install --with-deps
+```
+
 ## Usage
 
 ```bash
