@@ -50,23 +50,15 @@ func CaptureRequests(
 
 func getTriggerJS() string {
 	return `(function() {
-		// === 1. Trigger all DOM-related network activity ===
-		const evs = ['click','submit','change','mouseover','input'];
-		for(const el of document.querySelectorAll('*')){
-			for(const ev of evs){
-				try { el.dispatchEvent(new Event(ev, {bubbles:true})); }catch(e){}
-			}
-		}
+		// Prevent actual navigation
+		window.location.assign = window.location.replace = window.open = () => {};
+		HTMLFormElement.prototype.submit = function() {
+			console.log("Form submission blocked:", this);
+		};
 
-		// Submit all forms
-		for(const form of document.forms){
-			try { form.submit(); } catch(e){}
-		}
-
-		// === 2. Execute zero-argument HTTP-related functions ===
+		// === 1. Execute zero-argument HTTP-related functions ===
 		const httpPattern = /\b(fetch|XMLHttpRequest|axios|\.ajax|sendBeacon|WebSocket|EventSource|Worker|SharedWorker)\b/;
 
-		// Scan all global properties for functions
 		function collectNetworkFunctions(root) {
 			const results = [];
 			const seen = new WeakSet();
@@ -77,9 +69,7 @@ func getTriggerJS() string {
 					if (typeof val === "function" && !seen.has(val)) {
 						seen.add(val);
 
-						// Cheap pre-check: function name
 						if (!httpPattern.test(val.name)) {
-							// Expensive: fallback to toString only if necessary
 							const src = Function.prototype.toString.call(val);
 							if (httpPattern.test(src) && !src.includes("[native code]")) {
 								results.push({ name: key, fn: val });
@@ -88,19 +78,14 @@ func getTriggerJS() string {
 							results.push({ name: key, fn: val });
 						}
 					}
-				} catch (e) {
-					// Skip non-readable properties
-				}
+				} catch (e) {}
 			}
 			return results;
 		}
 
-		// Collect once
 		const candidates = collectNetworkFunctions(window);
-
 		console.log("Found HTTP-related functions:", candidates.map(c => c.name));
 
-		// Try triggering them
 		for (const { name, fn } of candidates) {
 			try {
 				if (fn.length === 0) {
@@ -109,6 +94,22 @@ func getTriggerJS() string {
 				}
 			} catch (e) {
 				console.warn("Error executing", name, e);
+			}
+		}
+
+
+		// Submit all forms
+		for (const form of document.forms) {
+			try { form.submit(); } catch (e) {}
+		}
+
+		// === 1. Trigger all DOM-related network activity ===
+		const evs = ['click','submit','change','mouseover','input'];
+		for (const el of document.querySelectorAll('*')) {
+			for (const ev of evs) {
+				try {
+					el.dispatchEvent(new Event(ev, { bubbles: true }));
+				} catch (e) {}
 			}
 		}
 	})();`
